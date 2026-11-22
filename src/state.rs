@@ -45,6 +45,14 @@ pub struct WftInfo {
     pub request_id: String,
     #[prost(int64, tag = "9")]
     pub original_scheduled_ms: i64,
+    /// A retry (attempt > 1) whose scheduled/started events aren't written until it completes,
+    /// like the Go server's transient workflow tasks.
+    #[prost(bool, tag = "10")]
+    pub transient: bool,
+    #[prost(string, tag = "11")]
+    pub identity: String,
+    #[prost(int64, tag = "12")]
+    pub history_size_at_start: i64,
 }
 
 pub const ACT_SCHEDULED: i32 = 0;

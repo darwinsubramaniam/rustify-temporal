@@ -30,7 +30,7 @@ client = await Client.connect("127.0.0.1:7233", namespace="default")
 |---|---|
 | Namespaces | register, describe, list (paging, include-deleted), update (state, retention, bad binaries, replication checks), deprecate; namespace states enforced like the Go server (38-step side-by-side check); `default` created automatically |
 | Workflows | start (id reuse and conflict policies, start delay, request-id dedupe), signal, signal-with-start, query, cancel, terminate, describe, history (long-poll, close-event filter), list/count |
-| Workflow tasks | sticky queues with partial history, task timeouts and retries, failed tasks, unhandled-command rejection, `return_new_workflow_task` |
+| Workflow tasks | same behaviour as the Go server, checked in 67 side-by-side steps: transient retries with growing timeouts, sticky queues and their timeouts, refused completions (bad commands, unseen signals, bad builds), eager activities, payload/pending limits, continue-as-new suggestions, `return_new_workflow_task` |
 | Commands | activities, timers, complete/fail/cancel, continue-as-new, markers (local activities, patches, side effects), search-attribute upsert, memo update, child workflows, signal external, cancel external |
 | Activities | dispatch, heartbeats (with details and cancel requests), server-side retries with backoff, `next_retry_delay`, non-retryable types, schedule-to-start / start-to-close / schedule-to-close / heartbeat timeouts, complete/fail/cancel by token or by id |
 | Workflow retries | retry policy on workflows, execution and run timeouts |
@@ -124,6 +124,7 @@ side-by-side check. Locally:
 cargo test                                         # unit tests
 ./scripts/e2e.sh                                   # Python SDK + Go SDK end-to-end tests
 ./scripts/namespace-parity.sh                      # same namespace steps on the Go server and here, compared
+./scripts/namespace-parity.sh e2e/wft_parity.py   # same workflow-task steps on both servers, compared
 ./scripts/sync-protos.sh --check                    # proto/ still matches the Go server's contract
 ```
 

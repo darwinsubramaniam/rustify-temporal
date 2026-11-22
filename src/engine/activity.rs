@@ -49,7 +49,22 @@ impl Inner {
         attempt: i32,
         identity: &str,
     ) -> Option<wsv1::PollActivityTaskQueueResponse> {
-        let ex = self.execs.get_mut(key)?;
+        let mut ex = self.execs.remove(key)?;
+        let r = self.start_activity_in(&mut ex, sid, attempt, identity);
+        self.put(ex);
+        r
+    }
+
+    /// Start an activity attempt of a run that's out of the map (also used for activities a
+    /// workflow task completion hands straight back to the worker).
+    pub fn start_activity_in(
+        &mut self,
+        ex: &mut Execution,
+        sid: i64,
+        attempt: i32,
+        identity: &str,
+    ) -> Option<wsv1::PollActivityTaskQueueResponse> {
+        let key = &ex.key();
         if !ex.s.is_open() {
             return None;
         }
@@ -67,7 +82,6 @@ impl Inner {
         let attrs = a.attrs.clone().unwrap_or_default();
         let wid = ex.s.workflow_id.clone();
         let wtype = ex.s.workflow_type.clone();
-        self.dirty.insert(key.clone());
         let st2c = dur_ms(&attrs.start_to_close_timeout);
         if st2c > 0 {
             self.add_timer(

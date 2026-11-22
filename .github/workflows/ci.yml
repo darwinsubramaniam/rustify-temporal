@@ -90,8 +90,8 @@ jobs:
       - name: Check proto/ against the Go server's contract
         run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/sync-protos.sh --check
 
-  namespace-parity:
-    name: Namespace behaviour matches the Go server
+  behaviour-parity:
+    name: Behaviour matches the Go server (namespaces, workflow tasks)
     needs: contract
     runs-on: ubuntu-latest
     steps:
@@ -113,5 +113,7 @@ jobs:
         with:
           go-version-file: .ci/temporal/go.mod
           cache-dependency-path: .ci/temporal/go.sum
-      - name: Same steps on the Go server and rustify-temporal
-        run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/namespace-parity.sh
+      - name: Namespaces - same steps on the Go server and rustify-temporal
+        run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/namespace-parity.sh e2e/namespace_parity.py
+      - name: Workflow tasks - same steps on the Go server and rustify-temporal
+        run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/namespace-parity.sh e2e/wft_parity.py

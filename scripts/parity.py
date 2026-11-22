@@ -36,8 +36,8 @@ PARTIAL = {
     "CountWorkflowExecutions": "Same filters as List; no GROUP BY.",
     "DescribeTaskQueue": "Recent pollers only; no backlog stats, rate limits or versioning info.",
     "DescribeWorkflowExecution": "No callbacks, pending Nexus operations or versioning info.",
-    "RespondWorkflowTaskCompleted": "No workflow-update protocol messages or Nexus commands; eager activities are never returned.",
-    "PollWorkflowTaskQueue": "No worker versioning, poller autoscaling hints or partitions.",
+    "RespondWorkflowTaskCompleted": "Matches the Go server (67-step check), including eager activities, size limits and retries; workflow-update messages and Nexus commands belong to those missing areas.",
+    "PollWorkflowTaskQueue": "Matches the Go server (67-step check); worker-versioning and poller-autoscaling fields belong to those missing areas.",
     "PollActivityTaskQueue": "No worker versioning, rate limiting or poller autoscaling hints.",
     "RecordActivityTaskHeartbeat": "Never reports activity paused or reset (those features are missing).",
     "RecordActivityTaskHeartbeatById": "Same as RecordActivityTaskHeartbeat.",
@@ -54,6 +54,8 @@ NOTES = {
     "ListNamespaces": "Paging and the include-deleted filter.",
     "DescribeNamespace": "By name or id.",
     "DeprecateNamespace": "New workflows are refused; running ones carry on.",
+    "RespondWorkflowTaskFailed": "Retries are transient (not written to history) like the Go server.",
+    "ResetStickyTaskQueue": "A waiting sticky task moves to the normal queue.",
 }
 
 GROUPS = [
@@ -129,8 +131,8 @@ p(f"| OperatorService (search attributes, clusters, Nexus endpoints) | {len(op)}
 if admin:
     p(f"| AdminService (internal: tdbg, replication, DLQ tools) | {len(admin)} | 0 | 0 | {len(admin)} |")
 p("")
-p("Namespaces are checked step by step against the Go server by `scripts/namespace-parity.sh`")
-p("(38 steps, all identical). Namespace states are enforced like the Go server: deprecated")
+p("Behaviour is checked step by step against the Go server with `scripts/namespace-parity.sh`:")
+p("namespaces (38 steps) and workflow tasks (`e2e/wft_parity.py`, 67 steps), all identical. Deprecated")
 p("namespaces refuse new workflows, deleted ones refuse everything but describe and list.\n")
 p("Everything a worker needs to run workflows (start, workflow and activity tasks, timers, signals,")
 p("queries, children, continue-as-new, retries, cancel, terminate, history) is in the ✅ and 🟡 rows.\n")
@@ -182,9 +184,9 @@ for row in [
     ("Sticky queues and partial history", "✅", "✅ Yes", "Falls back to the normal queue after the sticky timeout."),
     (
         "Workflow-task failure, timeout and retry",
-        "🟡",
+        "✅",
         "✅ Yes",
-        "Each failed attempt is written to history (Go hides repeats as transient).",
+        "Retries after the first failure are transient (written only if they complete); later attempts get longer timeouts.",
     ),
     ("Workflow id reuse and conflict policies", "✅", "✅ Yes", ""),
     (
@@ -198,7 +200,27 @@ for row in [
     ("Workflow updates", "✅", "❌ No", ""),
     ("Nexus operations", "✅", "❌ No", ""),
     ("Reset, pause/unpause, delete workflow", "✅", "❌ No", ""),
-    ("Eager workflow start / eager activities", "✅", "❌ No", "SDKs fall back to normal dispatch."),
+    (
+        "Sticky queues: schedule-to-start timeout, reset",
+        "✅",
+        "✅ Yes",
+        "The timeout is recorded and the task moves to the normal queue.",
+    ),
+    (
+        "Refused completions (bad commands, unseen signals, bad builds)",
+        "✅",
+        "✅ Yes",
+        "Same causes and errors; a refused retry leaves the task running.",
+    ),
+    (
+        "Payload and pending-work limits",
+        "✅",
+        "✅ Yes",
+        "2 MB payloads (terminates), 2000 pending activities or children.",
+    ),
+    ("Continue-as-new suggestion", "✅", "✅ Yes", "At 4096 events or 4 MB of history."),
+    ("Eager activities", "✅", "✅ Yes", "Handed back in the workflow task completion response."),
+    ("Eager workflow start", "✅", "❌ No", "SDKs fall back to normal dispatch."),
     ("Worker versioning (build ids, deployments)", "✅", "❌ No", ""),
     ("Completion callbacks and links", "✅", "❌ No", ""),
 ]:
@@ -242,7 +264,12 @@ for row in [
         "🟡 Partial",
         "Workflow start/signal/query/describe/list/terminate/cancel should work; schedules, batch, operator and admin commands don't. Not yet tested.",
     ),
-    ("Payload and history size limits", "✅ Enforced, warns and terminates", "❌ No", ""),
+    (
+        "Payload and history size limits",
+        "✅ Enforced, warns and terminates",
+        "✅ Yes",
+        "2 MB payloads; 50 MB or 51,200-event histories terminate (Go defaults).",
+    ),
     (
         "Official SDK compatibility",
         "All SDKs",

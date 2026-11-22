@@ -17,8 +17,8 @@ response shape, including the ones that answer *unimplemented*.
 | OperatorService (search attributes, clusters, Nexus endpoints) | 15 | 0 | 0 | 15 |
 | AdminService (internal: tdbg, replication, DLQ tools) | 50 | 0 | 0 | 50 |
 
-Namespaces are checked step by step against the Go server by `scripts/namespace-parity.sh`
-(38 steps, all identical). Namespace states are enforced like the Go server: deprecated
+Behaviour is checked step by step against the Go server with `scripts/namespace-parity.sh`:
+namespaces (38 steps) and workflow tasks (`e2e/wft_parity.py`, 67 steps), all identical. Deprecated
 namespaces refuse new workflows, deleted ones refuse everything but describe and list.
 
 Everything a worker needs to run workflows (start, workflow and activity tasks, timers, signals,
@@ -40,10 +40,10 @@ queries, children, continue-as-new, retries, cancel, terminate, history) is in t
 
 | Operation | rustify | Notes |
 |---|---|---|
-| `PollWorkflowTaskQueue` | 🟡 Partial | No worker versioning, poller autoscaling hints or partitions. |
-| `ResetStickyTaskQueue` | ✅ Yes |  |
-| `RespondWorkflowTaskCompleted` | 🟡 Partial | No workflow-update protocol messages or Nexus commands; eager activities are never returned. |
-| `RespondWorkflowTaskFailed` | ✅ Yes |  |
+| `PollWorkflowTaskQueue` | 🟡 Partial | Matches the Go server (67-step check); worker-versioning and poller-autoscaling fields belong to those missing areas. |
+| `ResetStickyTaskQueue` | ✅ Yes | A waiting sticky task moves to the normal queue. |
+| `RespondWorkflowTaskCompleted` | 🟡 Partial | Matches the Go server (67-step check), including eager activities, size limits and retries; workflow-update messages and Nexus commands belong to those missing areas. |
+| `RespondWorkflowTaskFailed` | ✅ Yes | Retries are transient (not written to history) like the Go server. |
 
 ### Activity tasks (workflow activities) (9/9)
 
@@ -264,7 +264,7 @@ Used by `tdbg`, `temporal operator` admin commands and replication. Served with 
 | Execution and run timeouts | ✅ | ✅ Yes |  |
 | Local activities, side effects, patching (markers) | ✅ | ✅ Yes | Stored as markers like the Go server. |
 | Sticky queues and partial history | ✅ | ✅ Yes | Falls back to the normal queue after the sticky timeout. |
-| Workflow-task failure, timeout and retry | 🟡 | ✅ Yes | Each failed attempt is written to history (Go hides repeats as transient). |
+| Workflow-task failure, timeout and retry | ✅ | ✅ Yes | Retries after the first failure are transient (written only if they complete); later attempts get longer timeouts. |
 | Workflow id reuse and conflict policies | ✅ | ✅ Yes |  |
 | Search attribute upsert and memo update | ✅ | 🟡 Partial | Stored and shown; not searchable in list filters. |
 | Start delay | ✅ | ✅ Yes |  |
@@ -272,7 +272,12 @@ Used by `tdbg`, `temporal operator` admin commands and replication. Served with 
 | Workflow updates | ✅ | ❌ No |  |
 | Nexus operations | ✅ | ❌ No |  |
 | Reset, pause/unpause, delete workflow | ✅ | ❌ No |  |
-| Eager workflow start / eager activities | ✅ | ❌ No | SDKs fall back to normal dispatch. |
+| Sticky queues: schedule-to-start timeout, reset | ✅ | ✅ Yes | The timeout is recorded and the task moves to the normal queue. |
+| Refused completions (bad commands, unseen signals, bad builds) | ✅ | ✅ Yes | Same causes and errors; a refused retry leaves the task running. |
+| Payload and pending-work limits | ✅ | ✅ Yes | 2 MB payloads (terminates), 2000 pending activities or children. |
+| Continue-as-new suggestion | ✅ | ✅ Yes | At 4096 events or 4 MB of history. |
+| Eager activities | ✅ | ✅ Yes | Handed back in the workflow task completion response. |
+| Eager workflow start | ✅ | ❌ No | SDKs fall back to normal dispatch. |
 | Worker versioning (build ids, deployments) | ✅ | ❌ No |  |
 | Completion callbacks and links | ✅ | ❌ No |  |
 
@@ -298,7 +303,7 @@ Used by `tdbg`, `temporal operator` admin commands and replication. Served with 
 | HTTP/JSON API (grpc-gateway) | ✅ | ❌ No |  |
 | Temporal Web UI | ✅ | ❌ No | The UI needs many missing operations. |
 | Temporal CLI | ✅ | 🟡 Partial | Workflow start/signal/query/describe/list/terminate/cancel should work; schedules, batch, operator and admin commands don't. Not yet tested. |
-| Payload and history size limits | ✅ Enforced, warns and terminates | ❌ No |  |
+| Payload and history size limits | ✅ Enforced, warns and terminates | ✅ Yes | 2 MB payloads; 50 MB or 51,200-event histories terminate (Go defaults). |
 | Official SDK compatibility | All SDKs | 🟡 Partial | Python SDK 1.36.1 (23 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested. |
 
 See `bench/RESULTS.md` for speed and resource use on the operations both servers have.

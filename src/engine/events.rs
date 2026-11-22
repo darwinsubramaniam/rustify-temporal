@@ -59,7 +59,7 @@ pub fn event_type(a: &A) -> enums::EventType {
     }
 }
 
-fn make_event(id: i64, a: A) -> history::HistoryEvent {
+pub fn make_event(id: i64, a: A) -> history::HistoryEvent {
     history::HistoryEvent {
         event_id: id,
         event_time: Some(now_ts()),
@@ -170,31 +170,19 @@ impl Inner {
         } else {
             ex.s.task_queue.clone()
         };
-        let timeout = {
-            let t = dur_ms(&ex.s.wft_timeout);
-            if t <= 0 {
-                DEFAULT_WFT_TIMEOUT_MS
-            } else {
-                t.min(MAX_WFT_TIMEOUT_MS)
-            }
+        let timeout = wft_timeout_for_attempt(base_wft_timeout(ex), attempt);
+        // Like the Go server, a retry (attempt > 1) is "transient": its scheduled and started
+        // events are only written if it completes, so a workflow failing in a loop doesn't grow
+        // its history. It takes the next event id without writing it.
+        let transient = attempt > 1;
+        let sid = if transient {
+            ex.s.next_event_id
+        } else {
+            push(
+                ex,
+                A::WorkflowTaskScheduledEventAttributes(wft_scheduled_attrs(ex, &queue, sticky, timeout, attempt)),
+            )
         };
-        let tq = taskqueue::TaskQueue {
-            name: queue.clone(),
-            kind: if sticky {
-                enums::TaskQueueKind::Sticky as i32
-            } else {
-                enums::TaskQueueKind::Normal as i32
-            },
-            normal_name: if sticky { ex.s.task_queue.clone() } else { String::new() },
-        };
-        let sid = push(
-            ex,
-            A::WorkflowTaskScheduledEventAttributes(history::WorkflowTaskScheduledEventAttributes {
-                task_queue: Some(tq),
-                start_to_close_timeout: Some(dur_from_ms(timeout)),
-                attempt,
-            }),
-        );
         let now = now_ms();
         ex.s.wft = Some(WftInfo {
             scheduled_id: sid,
@@ -206,7 +194,13 @@ impl Inner {
             timeout_ms: timeout,
             request_id: String::new(),
             original_scheduled_ms: now,
+            transient,
+            identity: String::new(),
+            history_size_at_start: 0,
         });
+        if transient {
+            ex.notify.notify_waiters();
+        }
         let key = ex.key();
         self.enqueue(
             &key.0,
@@ -254,5 +248,115 @@ impl Inner {
         ex.s.wft = None;
         ex.s.wft_due_ms = 0;
         flush_buffered(ex);
+    }
+}
+
+/// The run's configured workflow task timeout (10 s by default, at most 120 s).
+pub fn base_wft_timeout(ex: &Execution) -> i64 {
+    let t = dur_ms(&ex.s.wft_timeout);
+    if t <= 0 {
+        DEFAULT_WFT_TIMEOUT_MS
+    } else {
+        t.min(MAX_WFT_TIMEOUT_MS)
+    }
+}
+
+/// The Go server slows down repeated retries by lengthening their timeout instead of delaying
+/// them: from attempt 4 on, 5 s doubling per attempt, at most 10 minutes, is added.
+pub fn wft_timeout_for_attempt(base: i64, attempt: i32) -> i64 {
+    const MIN_ATTEMPTS: i32 = 3;
+    if attempt <= MIN_ATTEMPTS {
+        return base;
+    }
+    let n = (attempt - MIN_ATTEMPTS - 1).min(30) as u32;
+    base + (5_000i64.saturating_mul(1i64 << n)).min(600_000)
+}
+
+pub fn wft_scheduled_attrs(
+    ex: &Execution,
+    queue: &str,
+    sticky: bool,
+    timeout: i64,
+    attempt: i32,
+) -> history::WorkflowTaskScheduledEventAttributes {
+    history::WorkflowTaskScheduledEventAttributes {
+        task_queue: Some(taskqueue::TaskQueue {
+            name: queue.to_string(),
+            kind: if sticky {
+                enums::TaskQueueKind::Sticky as i32
+            } else {
+                enums::TaskQueueKind::Normal as i32
+            },
+            normal_name: if sticky { ex.s.task_queue.clone() } else { String::new() },
+        }),
+        start_to_close_timeout: Some(dur_from_ms(timeout)),
+        attempt,
+    }
+}
+
+/// Continue-as-new hints for a starting workflow task (the Go server's 4096 events / 4 MB).
+pub fn suggest_continue_as_new(ex: &Execution) -> Vec<i32> {
+    let mut reasons = Vec::new();
+    if ex.s.history_size >= SUGGEST_CAN_HISTORY_SIZE {
+        reasons.push(enums::SuggestContinueAsNewReason::HistorySizeTooLarge as i32);
+    }
+    if ex.s.next_event_id >= SUGGEST_CAN_HISTORY_COUNT {
+        reasons.push(enums::SuggestContinueAsNewReason::TooManyHistoryEvents as i32);
+    }
+    reasons
+}
+
+pub fn wft_started_attrs(w: &WftInfo, reasons: Vec<i32>) -> history::WorkflowTaskStartedEventAttributes {
+    history::WorkflowTaskStartedEventAttributes {
+        scheduled_event_id: w.scheduled_id,
+        identity: w.identity.clone(),
+        request_id: w.request_id.clone(),
+        suggest_continue_as_new: !reasons.is_empty(),
+        suggest_continue_as_new_reasons: reasons,
+        history_size_bytes: w.history_size_at_start,
+        ..Default::default()
+    }
+}
+
+/// The unwritten events of a transient workflow task (scheduled, and started once a worker has
+/// it), shown to workers and history readers after the written history, like the Go server.
+pub fn transient_events(ex: &Execution) -> Vec<history::HistoryEvent> {
+    // Only while it still sits at the end of the history: once other events were written after
+    // it was scheduled, it will start as a normal task instead.
+    let Some(w) =
+        ex.s.wft
+            .as_ref()
+            .filter(|w| w.transient && w.scheduled_id == ex.s.next_event_id)
+    else {
+        return Vec::new();
+    };
+    let sticky = !ex.s.sticky_queue.is_empty() && w.queue == ex.s.sticky_queue;
+    let mut out = vec![make_event(
+        w.scheduled_id,
+        A::WorkflowTaskScheduledEventAttributes(wft_scheduled_attrs(ex, &w.queue, sticky, w.timeout_ms, w.attempt)),
+    )];
+    out[0].event_time = Some(ts_from_ms(w.scheduled_ms));
+    if w.started_id > 0 {
+        let mut e = make_event(
+            w.started_id,
+            A::WorkflowTaskStartedEventAttributes(wft_started_attrs(w, suggest_continue_as_new(ex))),
+        );
+        e.event_time = Some(ts_from_ms(w.started_ms));
+        out.push(e);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wft_timeout_for_attempt;
+
+    #[test]
+    fn retries_get_longer_timeouts_like_the_go_server() {
+        assert_eq!(wft_timeout_for_attempt(10_000, 1), 10_000);
+        assert_eq!(wft_timeout_for_attempt(10_000, 3), 10_000);
+        assert_eq!(wft_timeout_for_attempt(10_000, 4), 15_000);
+        assert_eq!(wft_timeout_for_attempt(10_000, 5), 20_000);
+        assert_eq!(wft_timeout_for_attempt(10_000, 40), 610_000);
     }
 }

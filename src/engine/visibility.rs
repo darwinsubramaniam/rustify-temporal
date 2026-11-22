@@ -3,6 +3,13 @@
 use super::*;
 use crate::store::ListFilter;
 
+pub struct HistoryPage {
+    pub events: Vec<history::HistoryEvent>,
+    pub closed: bool,
+    pub next: i64,
+    pub transient: Vec<history::HistoryEvent>,
+}
+
 pub fn exec_info(ex: &Execution) -> workflow_pb::WorkflowExecutionInfo {
     let s = &ex.s;
     workflow_pb::WorkflowExecutionInfo {
@@ -126,12 +133,10 @@ pub fn parse_query(q: &str) -> R<ListFilter> {
 
 impl Inner {
     /// History of a run starting at `from` (an event id). Returns the events and whether the run is closed.
-    pub fn history_from(
-        &mut self,
-        key: &Key,
-        from: i64,
-        close_only: bool,
-    ) -> R<(Vec<history::HistoryEvent>, bool, i64)> {
+    /// History of a run starting at `from` (an event id): the written events, whether the run
+    /// is closed, the next event id, and the events of a transient workflow task that aren't
+    /// written yet (the Go server shows those at the end of the history).
+    pub fn history_from(&mut self, key: &Key, from: i64, close_only: bool) -> R<HistoryPage> {
         if !self.ensure_loaded(key)? {
             return Err(wf_not_found("", &key.1));
         }
@@ -143,10 +148,20 @@ impl Inner {
             } else {
                 vec![]
             };
-            return Ok((ev, closed, ex.s.next_event_id));
+            return Ok(HistoryPage {
+                events: ev,
+                closed,
+                next: ex.s.next_event_id,
+                transient: vec![],
+            });
         }
         let ev = ex.events.iter().filter(|e| e.event_id >= from).cloned().collect();
-        Ok((ev, closed, ex.s.next_event_id))
+        Ok(HistoryPage {
+            events: ev,
+            closed,
+            next: ex.s.next_event_id,
+            transient: super::events::transient_events(ex),
+        })
     }
 
     pub fn notify_of_run(&mut self, key: &Key) -> R<Arc<Notify>> {

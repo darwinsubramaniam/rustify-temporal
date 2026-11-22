@@ -32,6 +32,16 @@ pub const MAX_WFT_TIMEOUT_MS: i64 = 120_000;
 pub const DEFAULT_STICKY_TIMEOUT_MS: i64 = 5_000;
 pub const LONG_POLL_MS: i64 = 55_000;
 pub const HISTORY_LONG_POLL_MS: i64 = 20_000;
+// Go server limits (dynamic config defaults).
+pub const BLOB_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+pub const MEMO_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+pub const HISTORY_SIZE_LIMIT: i64 = 50 * 1024 * 1024;
+pub const HISTORY_COUNT_LIMIT: i64 = 50 * 1024;
+pub const SUGGEST_CAN_HISTORY_SIZE: i64 = 4 * 1024 * 1024;
+pub const SUGGEST_CAN_HISTORY_COUNT: i64 = 4 * 1024;
+pub const PENDING_ACTIVITIES_LIMIT: usize = 2000;
+pub const PENDING_CHILDREN_LIMIT: usize = 2000;
+pub const HISTORY_SERVICE_IDENTITY: &str = "history-service";
 
 pub struct Execution {
     pub s: ExecState,
@@ -530,7 +540,34 @@ impl Inner {
 
     // ---------- saving ----------
 
+    /// Terminate runs whose history grew past the Go server's limits (50 MB or 51,200 events).
+    fn enforce_history_limits(&mut self) {
+        let over: Vec<(Key, &'static str)> = self
+            .dirty
+            .iter()
+            .filter_map(|k| {
+                let ex = self.execs.get(k)?;
+                if !ex.s.is_open() {
+                    return None;
+                }
+                if ex.s.history_size > HISTORY_SIZE_LIMIT {
+                    Some((k.clone(), "Workflow history size exceeds limit."))
+                } else if ex.s.next_event_id - 1 > HISTORY_COUNT_LIMIT {
+                    Some((k.clone(), "Workflow history count exceeds limit."))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (k, reason) in over {
+            if let Err(e) = self.terminate_key(&k, reason, None, HISTORY_SERVICE_IDENTITY) {
+                tracing::warn!("terminating oversized run failed: {e}");
+            }
+        }
+    }
+
     pub fn commit(&mut self) -> R<()> {
+        self.enforce_history_limits();
         self.run_actions();
         if self.dirty.is_empty() {
             return Ok(());
