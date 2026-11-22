@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: Format (Rust, Python, Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: rustfmt
+        run: cargo fmt --check
+      - uses: astral-sh/setup-uv@v6
+      - name: ruff format
+        run: uvx ruff format --check e2e bench scripts
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: e2e-go/go.mod
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l e2e-go bench)
+          if [ -n "$unformatted" ]; then echo "Not gofmt-formatted:"; echo "$unformatted"; exit 1; fi
+
+  build-test:
+    name: Build, lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --locked --release
+      - name: Unit tests
+        run: cargo test --locked
+
+  e2e:
+    name: End-to-end (official Python and Go SDKs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: e2e-go/go.mod
+          cache-dependency-path: e2e-go/go.sum
+      - name: Python SDK and Go SDK tests
+        run: ./scripts/e2e.sh
+
+  contract:
+    name: Contract matches the Go server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the Go server commit the contract came from
+        id: version
+        run: echo "commit=$(awk '$1 == "temporalio/temporal" { print $2 }' proto/VERSION)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: temporalio/temporal
+          ref: ${{ steps.version.outputs.commit }}
+          path: .ci/temporal
+      - name: Check proto/ against the Go server's contract
+        run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/sync-protos.sh --check
+
+  namespace-parity:
+    name: Namespace behaviour matches the Go server
+    needs: contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the Go server commit the contract came from
+        id: version
+        run: echo "commit=$(awk '$1 == "temporalio/temporal" { print $2 }' proto/VERSION)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: temporalio/temporal
+          ref: ${{ steps.version.outputs.commit }}
+          path: .ci/temporal
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .ci/temporal/go.mod
+          cache-dependency-path: .ci/temporal/go.sum
+      - name: Same steps on the Go server and rustify-temporal
+        run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/namespace-parity.sh

@@ -174,7 +174,10 @@ class HeartbeatWorkflow:
     @workflow.run
     async def run(self) -> int:
         return await workflow.execute_activity(
-            heartbeat_then_finish, 20, start_to_close_timeout=timedelta(seconds=10), heartbeat_timeout=timedelta(seconds=2)
+            heartbeat_then_finish,
+            20,
+            start_to_close_timeout=timedelta(seconds=10),
+            heartbeat_timeout=timedelta(seconds=2),
         )
 
 
@@ -220,7 +223,10 @@ class ManyActivitiesWorkflow:
     @workflow.run
     async def run(self, n: int) -> int:
         results = await asyncio.gather(
-            *[workflow.execute_activity(say_hello, str(i), start_to_close_timeout=timedelta(seconds=10)) for i in range(n)]
+            *[
+                workflow.execute_activity(say_hello, str(i), start_to_close_timeout=timedelta(seconds=10))
+                for i in range(n)
+            ]
         )
         return len(results)
 

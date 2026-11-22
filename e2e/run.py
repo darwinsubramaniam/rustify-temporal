@@ -45,7 +45,9 @@ class Server:
     def start(self) -> None:
         f = open(self.log, "a")
         env = dict(os.environ, RUST_LOG=os.environ.get("RUST_LOG", "info"))
-        self.proc = subprocess.Popen([self.binary, "--port", str(self.port), "--db", self.db], stdout=f, stderr=f, env=env)
+        self.proc = subprocess.Popen(
+            [self.binary, "--port", str(self.port), "--db", self.db], stdout=f, stderr=f, env=env
+        )
         deadline = time.time() + 15
         while time.time() < deadline:
             try:
@@ -105,7 +107,9 @@ async def t_signal_query(c: Client):
 
 async def t_signal_with_start(c: Client):
     i = wid("sws")
-    h = await c.start_workflow(w.SignalQueryWorkflow.run, id=i, task_queue=TQ, start_signal="add", start_signal_args=["first"])
+    h = await c.start_workflow(
+        w.SignalQueryWorkflow.run, id=i, task_queue=TQ, start_signal="add", start_signal_args=["first"]
+    )
     await h.signal(w.SignalQueryWorkflow.finish)
     assert await h.result() == ["first"]
 
@@ -181,7 +185,10 @@ async def t_workflow_retry(c: Client):
     from temporalio.common import RetryPolicy
 
     r = await c.execute_workflow(
-        w.RetryingWorkflow.run, id=wid("wfretry"), task_queue=TQ, retry_policy=RetryPolicy(initial_interval=timedelta(milliseconds=100))
+        w.RetryingWorkflow.run,
+        id=wid("wfretry"),
+        task_queue=TQ,
+        retry_policy=RetryPolicy(initial_interval=timedelta(milliseconds=100)),
     )
     assert r == 3, r
 
@@ -205,7 +212,9 @@ async def t_many_activities(c: Client):
 
 
 async def t_local_activity(c: Client):
-    assert await c.execute_workflow(w.LocalActivityWorkflow.run, "local", id=wid("la"), task_queue=TQ) == "Hello, local!"
+    assert (
+        await c.execute_workflow(w.LocalActivityWorkflow.run, "local", id=wid("la"), task_queue=TQ) == "Hello, local!"
+    )
 
 
 async def t_describe_list(c: Client):
@@ -231,7 +240,9 @@ async def t_unknown_workflow(c: Client):
 
 async def t_execution_timeout(c: Client):
     try:
-        await c.execute_workflow(w.CancellableWorkflow.run, id=wid("wftimeout"), task_queue=TQ, execution_timeout=timedelta(seconds=1))
+        await c.execute_workflow(
+            w.CancellableWorkflow.run, id=wid("wftimeout"), task_queue=TQ, execution_timeout=timedelta(seconds=1)
+        )
         raise AssertionError("expected timeout")
     except WorkflowFailureError as e:
         assert isinstance(e.cause, TemporalTimeoutError), repr(e.cause)

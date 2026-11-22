@@ -19,19 +19,10 @@ echo "work folder: $OUT"
 
 echo "== building"
 (cd "$ROOT" && cargo build --release -q)
-(cd "$TEMPORAL_SRC" && go build -o "$OUT/temporal-server" ./cmd/server)
+"$ROOT/scripts/go-server.sh" "$OUT" "$TEMPORAL_SRC"
 go build -o "$OUT/bench" .
 RUST_BIN="$ROOT/target/release/rustify-temporal"
 
-# Go server config: the repo's SQLite-file config with its own ports (so it can run next to
-# anything already on 7233), a database in the work folder, and synchronous=NORMAL like rustify.
-OUT="$OUT" TEMPORAL_SRC="$TEMPORAL_SRC" perl -pe '
-    s#databaseName: "default"#databaseName: "$ENV{OUT}/go/temporal.db"#;
-    s/synchronous: 2/synchronous: 1/;
-    s/\b(7233|7234|7235|7239|7243|6933|6934|6935|6939|7936)\b/1$1/g;
-    s/127\.0\.0\.1:8000/127.0.0.1:18000/;
-    s#filepath: "config/dynamicconfig/development-sql.yaml"#filepath: "$ENV{TEMPORAL_SRC}/config/dynamicconfig/development-sql.yaml"#;
-  ' "$TEMPORAL_SRC/config/development-sqlite-file.yaml" > "$OUT/go-server.yaml"
 
 wait_port() { # port timeout_s
   local end=$(( $(date +%s) + $2 ))

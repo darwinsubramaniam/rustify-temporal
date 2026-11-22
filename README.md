@@ -28,7 +28,7 @@ client = await Client.connect("127.0.0.1:7233", namespace="default")
 
 | Area | Supported |
 |---|---|
-| Namespaces | register, describe, list, update; `default` created automatically |
+| Namespaces | register, describe, list (paging, include-deleted), update (state, retention, bad binaries, replication checks), deprecate; namespace states enforced like the Go server (38-step side-by-side check); `default` created automatically |
 | Workflows | start (id reuse and conflict policies, start delay, request-id dedupe), signal, signal-with-start, query, cancel, terminate, describe, history (long-poll, close-event filter), list/count |
 | Workflow tasks | sticky queues with partial history, task timeouts and retries, failed tasks, unhandled-command rejection, `return_new_workflow_task` |
 | Commands | activities, timers, complete/fail/cancel, continue-as-new, markers (local activities, patches, side effects), search-attribute upsert, memo update, child workflows, signal external, cancel external |
@@ -41,6 +41,10 @@ client = await Client.connect("127.0.0.1:7233", namespace="default")
 | Other | gRPC health service, gzip compression, `GetSystemInfo`, `GetClusterInfo`, `DescribeTaskQueue` (pollers) |
 
 ## Not yet
+
+The full operation-by-operation comparison with the Go server is in [`PARITY.md`](PARITY.md)
+(regenerate with `python3 scripts/parity.py > PARITY.md`).
+
 
 These answer with a clear error (`unimplemented` or `invalid argument`) instead of misbehaving:
 
@@ -71,6 +75,21 @@ These compare only what both servers do: the Go server also carries sharding, re
 features rustify-temporal doesn't have yet, which costs it some of this. See the caveats in
 `bench/RESULTS.md`.
 
+## Staying on the Go server's contract
+
+`proto/` is a copy of the Go server's own contract, and all request, response and message types
+are generated from it at build time, so their shapes can't drift from the Go server:
+
+- the public API at exactly the version the Go server pins (`go.temporal.io/api` in its `go.mod`,
+  resolved to the `temporalio/api` commit behind it), and
+- the Go server's internal protos (`proto/internal`, from `temporalio/temporal/proto`), including the
+  AdminService, which is served with its exact contract.
+
+`proto/VERSION` records the versions. `scripts/sync-protos.sh` updates the copy from the Go server;
+`scripts/sync-protos.sh --check` fails if it has drifted. The contract fixes the *shapes*; what
+each operation *does* (validation, errors, ordering) is checked against the real Go server with
+`scripts/namespace-parity.sh` and the SDK tests.
+
 ## How it works
 
 ```
@@ -92,13 +111,20 @@ SDK workers / clients ──gRPC──► service.rs (WorkflowService)
 
 Each run's mutable state is itself a protobuf message (`state.rs`) saved next to its history
 events. Task queues are in memory and long-polled; they are rebuilt from the saved state on start.
-The Temporal API protos are vendored under `proto/` (MIT, from temporalio/api).
+The protos under `proto/` are the Go server's contract (MIT, from temporalio/api and temporalio/temporal).
 
 ## Tests
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request:
+formatting (rustfmt, ruff, gofmt), clippy with warnings as errors, release build, unit tests, the
+Python and Go SDK end-to-end tests, the contract check against the Go server, and the namespace
+side-by-side check. Locally:
 
 ```bash
 cargo test                                         # unit tests
 ./scripts/e2e.sh                                   # Python SDK + Go SDK end-to-end tests
+./scripts/namespace-parity.sh                      # same namespace steps on the Go server and here, compared
+./scripts/sync-protos.sh --check                    # proto/ still matches the Go server's contract
 ```
 
 `scripts/e2e.sh` builds the server, runs the Python suite (it starts its own server, including a

@@ -4,7 +4,7 @@
 
 pub mod activity;
 mod events;
-mod namespace;
+pub mod namespace;
 mod query;
 mod timers;
 mod visibility;
@@ -43,7 +43,12 @@ pub struct Execution {
 impl Execution {
     pub fn new(s: ExecState, events: Vec<history::HistoryEvent>) -> Self {
         let saved = events.len();
-        Execution { s, events, saved_events: saved, notify: Arc::new(Notify::new()) }
+        Execution {
+            s,
+            events,
+            saved_events: saved,
+            notify: Arc::new(Notify::new()),
+        }
     }
     pub fn key(&self) -> Key {
         (self.s.namespace.clone(), self.s.run_id.clone())
@@ -60,9 +65,18 @@ pub type QKey = (String, String, QKind); // (namespace, name, kind)
 
 #[derive(Clone, Debug)]
 pub enum TaskRef {
-    Wft { run_id: String, scheduled_id: i64 },
-    Query { query_id: String },
-    Activity { run_id: String, scheduled_id: i64, attempt: i32 },
+    Wft {
+        run_id: String,
+        scheduled_id: i64,
+    },
+    Query {
+        query_id: String,
+    },
+    Activity {
+        run_id: String,
+        scheduled_id: i64,
+        attempt: i32,
+    },
 }
 
 #[derive(Default)]
@@ -74,17 +88,53 @@ pub struct Queue {
 
 #[derive(Clone, Debug)]
 pub enum TimerKind {
-    User { key: Key, timer_id: String, started_id: i64 },
-    WftTimeout { key: Key, scheduled_id: i64, started_id: i64 },
-    StickyTimeout { key: Key, scheduled_id: i64 },
-    WftDue { key: Key },
-    ActRetry { key: Key, scheduled_id: i64, attempt: i32 },
-    ActScheduleToStart { key: Key, scheduled_id: i64, attempt: i32 },
-    ActStartToClose { key: Key, scheduled_id: i64, attempt: i32 },
-    ActHeartbeat { key: Key, scheduled_id: i64, attempt: i32 },
-    ActScheduleToClose { key: Key, scheduled_id: i64 },
-    RunTimeout { key: Key },
-    QueryStickyFallback { query_id: String },
+    User {
+        key: Key,
+        timer_id: String,
+        started_id: i64,
+    },
+    WftTimeout {
+        key: Key,
+        scheduled_id: i64,
+        started_id: i64,
+    },
+    StickyTimeout {
+        key: Key,
+        scheduled_id: i64,
+    },
+    WftDue {
+        key: Key,
+    },
+    ActRetry {
+        key: Key,
+        scheduled_id: i64,
+        attempt: i32,
+    },
+    ActScheduleToStart {
+        key: Key,
+        scheduled_id: i64,
+        attempt: i32,
+    },
+    ActStartToClose {
+        key: Key,
+        scheduled_id: i64,
+        attempt: i32,
+    },
+    ActHeartbeat {
+        key: Key,
+        scheduled_id: i64,
+        attempt: i32,
+    },
+    ActScheduleToClose {
+        key: Key,
+        scheduled_id: i64,
+    },
+    RunTimeout {
+        key: Key,
+    },
+    QueryStickyFallback {
+        query_id: String,
+    },
 }
 
 pub struct TimerEntry {
@@ -111,13 +161,40 @@ impl Ord for TimerEntry {
 
 /// Work that touches another run, done after the current change (children, signals to other
 /// workflows, telling a parent its child closed).
+// Short-lived values passed once; boxing the large variant would only add allocations.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Action {
-    StartChild { parent: Key, initiated_id: i64, attrs: history::StartChildWorkflowExecutionInitiatedEventAttributes },
-    ChildClosed { parent: crate::state::ParentInfo, child_ns: String, child: common::WorkflowExecution, child_type: String, close: history::history_event::Attributes },
-    SignalExternal { source: Key, initiated_id: i64, attrs: history::SignalExternalWorkflowExecutionInitiatedEventAttributes, request_id: String },
-    CancelExternal { source: Key, initiated_id: i64, attrs: history::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes },
-    ApplyParentClosePolicy { ns: String, workflow_id: String, run_id: String, policy: i32, parent: common::WorkflowExecution },
+    StartChild {
+        parent: Key,
+        initiated_id: i64,
+        attrs: history::StartChildWorkflowExecutionInitiatedEventAttributes,
+    },
+    ChildClosed {
+        parent: crate::state::ParentInfo,
+        child_ns: String,
+        child: common::WorkflowExecution,
+        child_type: String,
+        close: history::history_event::Attributes,
+    },
+    SignalExternal {
+        source: Key,
+        initiated_id: i64,
+        attrs: history::SignalExternalWorkflowExecutionInitiatedEventAttributes,
+        request_id: String,
+    },
+    CancelExternal {
+        source: Key,
+        initiated_id: i64,
+        attrs: history::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes,
+    },
+    ApplyParentClosePolicy {
+        ns: String,
+        workflow_id: String,
+        run_id: String,
+        policy: i32,
+        parent: common::WorkflowExecution,
+    },
 }
 
 pub struct NsEntry {
@@ -161,7 +238,10 @@ impl Engine {
             actions: VecDeque::new(),
         };
         inner.recover()?;
-        Ok(Arc::new(Engine { inner: Mutex::new(inner), timer_notify }))
+        Ok(Arc::new(Engine {
+            inner: Mutex::new(inner),
+            timer_notify,
+        }))
     }
 
     pub fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -242,11 +322,26 @@ impl Inner {
             if w.started_id > 0 {
                 let at = w.started_ms + w.timeout_ms;
                 let (sid, st) = (w.scheduled_id, w.started_id);
-                self.add_timer(at, TimerKind::WftTimeout { key: key.clone(), scheduled_id: sid, started_id: st });
+                self.add_timer(
+                    at,
+                    TimerKind::WftTimeout {
+                        key: key.clone(),
+                        scheduled_id: sid,
+                        started_id: st,
+                    },
+                );
             } else {
                 w.queue = ex.s.task_queue.clone();
                 let sid = w.scheduled_id;
-                self.enqueue(&key.0, &ex.s.task_queue, QKind::Workflow, TaskRef::Wft { run_id: key.1.clone(), scheduled_id: sid });
+                self.enqueue(
+                    &key.0,
+                    &ex.s.task_queue,
+                    QKind::Workflow,
+                    TaskRef::Wft {
+                        run_id: key.1.clone(),
+                        scheduled_id: sid,
+                    },
+                );
             }
         }
         if ex.s.wft_due_ms > 0 {
@@ -258,34 +353,84 @@ impl Inner {
             let tq = attrs.task_queue.as_ref().map(|t| t.name.clone()).unwrap_or_default();
             match a.state {
                 crate::state::ACT_SCHEDULED => {
-                    self.enqueue(&key.0, &tq, QKind::Activity, TaskRef::Activity { run_id: key.1.clone(), scheduled_id: a.scheduled_id, attempt: a.attempt });
+                    self.enqueue(
+                        &key.0,
+                        &tq,
+                        QKind::Activity,
+                        TaskRef::Activity {
+                            run_id: key.1.clone(),
+                            scheduled_id: a.scheduled_id,
+                            attempt: a.attempt,
+                        },
+                    );
                     let s2s = dur_ms(&attrs.schedule_to_start_timeout);
                     if s2s > 0 {
-                        self.add_timer(a.attempt_scheduled_ms + s2s, TimerKind::ActScheduleToStart { key: key.clone(), scheduled_id: a.scheduled_id, attempt: a.attempt });
+                        self.add_timer(
+                            a.attempt_scheduled_ms + s2s,
+                            TimerKind::ActScheduleToStart {
+                                key: key.clone(),
+                                scheduled_id: a.scheduled_id,
+                                attempt: a.attempt,
+                            },
+                        );
                     }
                 }
                 crate::state::ACT_STARTED => {
                     let st2c = dur_ms(&attrs.start_to_close_timeout);
                     if st2c > 0 {
-                        self.add_timer(a.started_ms + st2c, TimerKind::ActStartToClose { key: key.clone(), scheduled_id: a.scheduled_id, attempt: a.attempt });
+                        self.add_timer(
+                            a.started_ms + st2c,
+                            TimerKind::ActStartToClose {
+                                key: key.clone(),
+                                scheduled_id: a.scheduled_id,
+                                attempt: a.attempt,
+                            },
+                        );
                     }
                     let hb = dur_ms(&attrs.heartbeat_timeout);
                     if hb > 0 {
                         let last = a.last_heartbeat_ms.max(a.started_ms);
-                        self.add_timer(last + hb, TimerKind::ActHeartbeat { key: key.clone(), scheduled_id: a.scheduled_id, attempt: a.attempt });
+                        self.add_timer(
+                            last + hb,
+                            TimerKind::ActHeartbeat {
+                                key: key.clone(),
+                                scheduled_id: a.scheduled_id,
+                                attempt: a.attempt,
+                            },
+                        );
                     }
                 }
                 _ => {
-                    self.add_timer(a.next_attempt_ms, TimerKind::ActRetry { key: key.clone(), scheduled_id: a.scheduled_id, attempt: a.attempt });
+                    self.add_timer(
+                        a.next_attempt_ms,
+                        TimerKind::ActRetry {
+                            key: key.clone(),
+                            scheduled_id: a.scheduled_id,
+                            attempt: a.attempt,
+                        },
+                    );
                 }
             }
             if a.expiration_ms > 0 {
-                self.add_timer(a.expiration_ms, TimerKind::ActScheduleToClose { key: key.clone(), scheduled_id: a.scheduled_id });
+                self.add_timer(
+                    a.expiration_ms,
+                    TimerKind::ActScheduleToClose {
+                        key: key.clone(),
+                        scheduled_id: a.scheduled_id,
+                    },
+                );
             }
         }
         let timers: Vec<_> = ex.s.timers.values().cloned().collect();
         for t in timers {
-            self.add_timer(t.fire_ms, TimerKind::User { key: key.clone(), timer_id: t.timer_id, started_id: t.started_id });
+            self.add_timer(
+                t.fire_ms,
+                TimerKind::User {
+                    key: key.clone(),
+                    timer_id: t.timer_id,
+                    started_id: t.started_id,
+                },
+            );
         }
         self.arm_run_timeout(ex);
         let _ = now;
@@ -294,7 +439,11 @@ impl Inner {
 
     pub fn arm_run_timeout(&mut self, ex: &Execution) {
         let run = dur_ms(&ex.s.run_timeout);
-        let mut deadline = if run > 0 { ex.s.execution_ms.max(ex.s.start_ms) + run } else { 0 };
+        let mut deadline = if run > 0 {
+            ex.s.execution_ms.max(ex.s.start_ms) + run
+        } else {
+            0
+        };
         if ex.s.expiration_ms > 0 && (deadline == 0 || ex.s.expiration_ms < deadline) {
             deadline = ex.s.expiration_ms;
         }
@@ -369,7 +518,11 @@ impl Inner {
     pub fn add_timer(&mut self, at_ms: i64, kind: TimerKind) {
         self.timer_seq += 1;
         let first = self.timers.peek().map(|Reverse(t)| t.at_ms);
-        self.timers.push(Reverse(TimerEntry { at_ms, seq: self.timer_seq, kind }));
+        self.timers.push(Reverse(TimerEntry {
+            at_ms,
+            seq: self.timer_seq,
+            kind,
+        }));
         if first.is_none_or(|f| at_ms < f) {
             self.timer_notify.notify_one();
         }
