@@ -1,6 +1,11 @@
 //! Workflow tasks: handing them to workers, and applying the commands a worker sends back.
 
-use super::events::{flush_buffered, push};
+use super::events::{
+    base_wft_timeout, flush_buffered, push, suggest_continue_as_new, transient_events, wft_scheduled_attrs,
+    wft_started_attrs,
+};
+use prost::Message;
+
 use super::*;
 use crate::state::{ACT_SCHEDULED, ActivityInfo, ChildInfo, TimerInfo};
 use command::command::Attributes as C;
@@ -21,7 +26,7 @@ impl Inner {
             };
             let r = match t {
                 TaskRef::Wft { run_id, scheduled_id } => {
-                    self.start_wft(&(ns.to_string(), run_id), scheduled_id, queue, identity)?
+                    self.start_wft(&(ns.to_string(), run_id), scheduled_id, queue, identity, false)?
                 }
                 TaskRef::Query { query_id } => self.start_query_task(&query_id, queue)?,
                 TaskRef::Activity { .. } => None,
@@ -32,13 +37,15 @@ impl Inner {
         }
     }
 
-    /// Mark the workflow task started and build what the worker receives.
+    /// Mark the workflow task started and build what the worker receives. `partial` sends only
+    /// the events since the last completed task (for a task returned with a completion).
     pub fn start_wft(
         &mut self,
         key: &Key,
         scheduled_id: i64,
         queue: &str,
         identity: &str,
+        partial: bool,
     ) -> R<Option<wsv1::PollWorkflowTaskQueueResponse>> {
         let Some(ex) = self.execs.get(key) else { return Ok(None) };
         let valid = ex.s.is_open()
@@ -52,45 +59,64 @@ impl Inner {
         }
         let mut ex = self.execs.remove(key).expect("present");
         let now = now_ms();
-        let request_id = new_id();
-        let hist_size = ex.s.history_size;
-        let started_id = push(
-            &mut ex,
-            A::WorkflowTaskStartedEventAttributes(history::WorkflowTaskStartedEventAttributes {
-                scheduled_event_id: scheduled_id,
-                identity: identity.to_string(),
-                request_id: request_id.clone(),
-                history_size_bytes: hist_size,
-                ..Default::default()
-            }),
-        );
-        let w = ex.s.wft.as_mut().expect("wft");
-        w.started_id = started_id;
+        let sticky = !ex.s.sticky_queue.is_empty() && ex.s.sticky_queue == queue;
+        // A transient retry stops being transient once new events were written since it was
+        // scheduled: it becomes a normal attempt 1 with written events (as in the Go server).
+        let mut w = ex.s.wft.clone().expect("wft");
+        if w.transient && w.scheduled_id != ex.s.next_event_id {
+            let base = base_wft_timeout(&ex);
+            let attrs = wft_scheduled_attrs(&ex, queue, sticky, base, 1);
+            w.scheduled_id = push(&mut ex, A::WorkflowTaskScheduledEventAttributes(attrs));
+            w.attempt = 1;
+            w.transient = false;
+            w.timeout_ms = base;
+        }
+        w.identity = identity.to_string();
+        w.request_id = new_id();
         w.started_ms = now;
-        w.request_id = request_id;
-        let (attempt, timeout, sched_ms) = (w.attempt, w.timeout_ms, w.scheduled_ms);
+        w.history_size_at_start = ex.s.history_size;
+        let reasons = suggest_continue_as_new(&ex);
+        w.started_id = if w.transient {
+            w.scheduled_id + 1
+        } else {
+            push(
+                &mut ex,
+                A::WorkflowTaskStartedEventAttributes(wft_started_attrs(&w, reasons)),
+            )
+        };
+        let (sid, started_id, attempt, timeout, sched_ms) =
+            (w.scheduled_id, w.started_id, w.attempt, w.timeout_ms, w.scheduled_ms);
+        ex.s.wft = Some(w);
+        if !ex.s.wft.as_ref().is_some_and(|w| w.transient) {
+            ex.notify.notify_waiters();
+        }
         self.add_timer(
             now + timeout,
             TimerKind::WftTimeout {
                 key: key.clone(),
-                scheduled_id,
+                scheduled_id: sid,
                 started_id,
             },
         );
-        let sticky = !ex.s.sticky_queue.is_empty() && ex.s.sticky_queue == queue;
-        let first = if sticky { ex.s.last_completed_started_id + 1 } else { 1 };
-        let events: Vec<_> = ex.events.iter().filter(|e| e.event_id >= first).cloned().collect();
+        let first = if sticky || partial {
+            ex.s.last_completed_started_id + 1
+        } else {
+            1
+        };
+        let mut events: Vec<_> = ex.events.iter().filter(|e| e.event_id >= first).cloned().collect();
+        events.extend(transient_events(&ex));
         let queries = self.attach_queries(key, started_id);
         let token = TaskToken {
             k: "wft".into(),
             ns: key.0.clone(),
             wid: ex.s.workflow_id.clone(),
             rid: key.1.clone(),
-            sid: scheduled_id,
+            sid,
             att: attempt,
             st: started_id,
             ..Default::default()
         };
+        let backlog = self.queue(&key.0, queue, QKind::Workflow).tasks.len() as i64;
         let resp = wsv1::PollWorkflowTaskQueueResponse {
             task_token: token.encode(),
             workflow_execution: Some(common::WorkflowExecution {
@@ -103,7 +129,7 @@ impl Inner {
             previous_started_event_id: ex.s.last_completed_started_id,
             started_event_id: started_id,
             attempt,
-            backlog_count_hint: 0,
+            backlog_count_hint: backlog,
             history: Some(history::History { events }),
             workflow_execution_task_queue: Some(taskqueue::TaskQueue {
                 name: ex.s.task_queue.clone(),
@@ -156,23 +182,19 @@ impl Inner {
         // A build marked bad in the namespace can't complete workflow tasks (like the Go server).
         if self.is_bad_binary(&key.0, &r.binary_checksum) {
             let msg = format!("binary {} is marked as bad deployment", r.binary_checksum);
-            self.fail_wft_inner(
-                &mut ex,
-                enums::WorkflowTaskFailedCause::BadBinary,
-                Some(server_failure(&msg, true)),
-                &r.identity,
-                true,
-            );
+            let reject = Reject {
+                cause: enums::WorkflowTaskFailedCause::BadBinary,
+                msg,
+                terminate: false,
+            };
+            let st = self.reject_wft(&mut ex, &w, reject, &r.identity);
             self.put(ex);
-            return Err(invalid(msg));
+            return Err(st);
         }
 
-        // Validate commands first so a bad one fails the task without partial writes.
-        if let Err((cause, msg)) = validate_commands(&ex, &r.commands) {
-            self.fail_wft_inner(&mut ex, cause, Some(server_failure(&msg, true)), &r.identity, true);
-            self.put(ex);
-            return Err(invalid(msg));
-        }
+        // Check every command before writing anything; a bad one fails the task (or, for an
+        // oversized payload, terminates the workflow), as the Go server does.
+        let mut reject = validate_commands(&ex, &r.commands).err();
         // A workflow can't close while new events it hasn't seen are waiting.
         let closes = r.commands.iter().any(|c| {
             matches!(
@@ -183,16 +205,29 @@ impl Inner {
                     | Some(C::ContinueAsNewWorkflowExecutionCommandAttributes(_))
             )
         });
-        if closes && !ex.s.buffered.is_empty() {
-            self.fail_wft_inner(
-                &mut ex,
-                enums::WorkflowTaskFailedCause::UnhandledCommand,
-                None,
-                &r.identity,
-                false,
-            );
+        if reject.is_none() && closes && !ex.s.buffered.is_empty() {
+            reject = Some(Reject {
+                cause: enums::WorkflowTaskFailedCause::UnhandledCommand,
+                msg: String::new(),
+                terminate: false,
+            });
+        }
+        if let Some(reject) = reject {
+            let st = self.reject_wft(&mut ex, &w, reject, &r.identity);
             self.put(ex);
-            return Ok(Default::default());
+            return Err(st);
+        }
+
+        // A transient retry's scheduled and started events are written now that it completed.
+        if w.transient {
+            let sticky = !ex.s.sticky_queue.is_empty() && w.queue == ex.s.sticky_queue;
+            let attrs = wft_scheduled_attrs(&ex, &w.queue, sticky, w.timeout_ms, w.attempt);
+            push(&mut ex, A::WorkflowTaskScheduledEventAttributes(attrs));
+            let reasons = suggest_continue_as_new(&ex);
+            push(
+                &mut ex,
+                A::WorkflowTaskStartedEventAttributes(wft_started_attrs(&w, reasons)),
+            );
         }
 
         let completed_id = push(
@@ -226,13 +261,17 @@ impl Inner {
             }
         }
 
+        let mut need_new_task = false;
+        let mut eager = Vec::new();
         for c in r.commands {
             if !ex.s.is_open() {
                 break;
             }
             let Some(a) = c.attributes else { continue };
             let user_metadata = c.user_metadata;
-            self.apply_command(&mut ex, a, completed_id, &r.identity)?;
+            let effect = self.apply_command(&mut ex, a, completed_id, &r.identity)?;
+            need_new_task |= effect.new_task;
+            eager.extend(effect.eager_activity);
             if user_metadata.is_some()
                 && let Some(last) = ex.events.last_mut()
                 && last.event_id > completed_id
@@ -242,16 +281,25 @@ impl Inner {
             }
         }
 
+        // Activities the worker asked to run right away are handed back in the response.
+        let mut activity_tasks = Vec::new();
+        if ex.s.is_open() {
+            for sid in eager {
+                if let Some(t) = self.start_activity_in(&mut ex, sid, 1, &r.identity) {
+                    activity_tasks.push(t);
+                }
+            }
+        }
         let mut new_task = None;
         if ex.s.is_open() {
             let had_buffered = flush_buffered(&mut ex);
-            if had_buffered || r.force_create_new_workflow_task {
+            if had_buffered || need_new_task || r.force_create_new_workflow_task {
                 self.schedule_wft(&mut ex, 1);
                 if r.return_new_workflow_task {
                     let w = ex.s.wft.clone().expect("scheduled");
                     let k = ex.key();
                     self.put(ex);
-                    new_task = self.start_wft(&k, w.scheduled_id, &w.queue, &r.identity)?;
+                    new_task = self.start_wft(&k, w.scheduled_id, &w.queue, &r.identity, true)?;
                     ex = self.take(&k)?;
                 }
             }
@@ -263,13 +311,14 @@ impl Inner {
         self.put(ex);
         Ok(wsv1::RespondWorkflowTaskCompletedResponse {
             workflow_task: new_task,
-            activity_tasks: vec![],
+            activity_tasks,
             reset_history_event_id: 0,
         })
     }
 
-    fn apply_command(&mut self, ex: &mut Execution, a: C, completed_id: i64, identity: &str) -> R<()> {
+    fn apply_command(&mut self, ex: &mut Execution, a: C, completed_id: i64, identity: &str) -> R<CommandEffect> {
         let key = ex.key();
+        let mut effect = CommandEffect::default();
         match a {
             C::ScheduleActivityTaskCommandAttributes(c) => {
                 let run_t = dur_ms(&ex.s.run_timeout);
@@ -327,17 +376,22 @@ impl Inner {
                         ..Default::default()
                     },
                 );
-                self.enqueue(
-                    &key.0,
-                    &tq.name,
-                    QKind::Activity,
-                    TaskRef::Activity {
-                        run_id: key.1.clone(),
-                        scheduled_id: sid,
-                        attempt: 1,
-                    },
-                );
-                if s2s > 0 && s2s < s2c {
+                if c.request_eager_execution {
+                    // Started in this response instead of going through the task queue.
+                    effect.eager_activity = Some(sid);
+                } else {
+                    self.enqueue(
+                        &key.0,
+                        &tq.name,
+                        QKind::Activity,
+                        TaskRef::Activity {
+                            run_id: key.1.clone(),
+                            scheduled_id: sid,
+                            attempt: 1,
+                        },
+                    );
+                }
+                if s2s > 0 && s2s < s2c && !c.request_eager_execution {
                     self.add_timer(
                         now + s2s,
                         TimerKind::ActScheduleToStart {
@@ -386,6 +440,8 @@ impl Inner {
                                 worker_version: None,
                             }),
                         );
+                        // The workflow learns of the cancellation in a new task (Go server).
+                        effect.new_task = true;
                     }
                 }
             }
@@ -627,7 +683,7 @@ impl Inner {
             }
             _ => {}
         }
-        Ok(())
+        Ok(effect)
     }
 
     pub fn respond_wft_failed(&mut self, r: wsv1::RespondWorkflowTaskFailedRequest) -> R<()> {
@@ -635,9 +691,41 @@ impl Inner {
         let mut ex = self.check_wft_token(&tok)?;
         let cause =
             enums::WorkflowTaskFailedCause::try_from(r.cause).unwrap_or(enums::WorkflowTaskFailedCause::Unspecified);
-        self.fail_wft_inner(&mut ex, cause, r.failure, &r.identity, true);
+        self.fail_wft_inner(&mut ex, cause, r.failure, &r.identity);
         self.put(ex);
         Ok(())
+    }
+
+    /// A completion the server refuses. On a retry (attempt > 1) nothing is recorded and the
+    /// task keeps running until it times out; otherwise the task fails (and for oversized
+    /// payloads the workflow is terminated). Returns the error for the worker (Go server rules).
+    fn reject_wft(&mut self, ex: &mut Execution, w: &crate::state::WftInfo, reject: Reject, identity: &str) -> Status {
+        let msg = if reject.msg.is_empty() {
+            reject.cause.as_str_name().to_string()
+        } else {
+            format!("{}: {}", reject.cause.as_str_name(), reject.msg)
+        };
+        if w.attempt > 1 && reject.cause != enums::WorkflowTaskFailedCause::UnhandledCommand {
+            return invalid(msg);
+        }
+        let failure = (!reject.msg.is_empty()).then(|| server_failure(&reject.msg, true));
+        let next = self.record_wft_failure(ex, reject.cause, failure, identity);
+        if reject.terminate {
+            ex.s.wft = None;
+            flush_buffered(ex);
+            push(
+                ex,
+                A::WorkflowExecutionTerminatedEventAttributes(history::WorkflowExecutionTerminatedEventAttributes {
+                    reason: msg.clone(),
+                    details: None,
+                    identity: HISTORY_SERVICE_IDENTITY.into(),
+                }),
+            );
+            self.finish_close(ex, enums::WorkflowExecutionStatus::Terminated, true);
+        } else {
+            self.retry_wft(ex, next);
+        }
+        invalid(msg)
     }
 
     /// Record a failed workflow task and schedule the next attempt.
@@ -647,43 +735,43 @@ impl Inner {
         cause: enums::WorkflowTaskFailedCause,
         f: Option<failure::Failure>,
         identity: &str,
-        count_attempt: bool,
     ) {
-        let w = ex.s.wft.clone().expect("running task");
-        push(
-            ex,
-            A::WorkflowTaskFailedEventAttributes(history::WorkflowTaskFailedEventAttributes {
-                scheduled_event_id: w.scheduled_id,
-                started_event_id: w.started_id,
-                cause: cause as i32,
-                failure: f,
-                identity: identity.to_string(),
-                ..Default::default()
-            }),
-        );
-        let next_attempt = if count_attempt && cause != enums::WorkflowTaskFailedCause::ResetStickyTaskQueue {
-            w.attempt + 1
-        } else {
-            1
-        };
-        self.retry_wft(ex, next_attempt);
+        let next = self.record_wft_failure(ex, cause, f, identity);
+        self.retry_wft(ex, next);
     }
 
-    /// After a failed or timed-out workflow task: drop stickiness, write held-back events and
-    /// try again (with a growing pause after repeated failures).
+    /// Write the failed event (not for a transient retry) and work out the next attempt number.
+    fn record_wft_failure(
+        &mut self,
+        ex: &mut Execution,
+        cause: enums::WorkflowTaskFailedCause,
+        f: Option<failure::Failure>,
+        identity: &str,
+    ) -> i32 {
+        let w = ex.s.wft.clone().expect("running task");
+        if !w.transient {
+            push(
+                ex,
+                A::WorkflowTaskFailedEventAttributes(history::WorkflowTaskFailedEventAttributes {
+                    scheduled_event_id: w.scheduled_id,
+                    started_event_id: w.started_id,
+                    cause: cause as i32,
+                    failure: f,
+                    identity: identity.to_string(),
+                    ..Default::default()
+                }),
+            );
+        }
+        next_attempt(ex, &w, true)
+    }
+
+    /// After a failed or timed-out workflow task: write held-back events and schedule the next
+    /// attempt right away (later attempts get longer timeouts instead of a delay). New events
+    /// reset the attempt to 1, as in the Go server.
     pub fn retry_wft(&mut self, ex: &mut Execution, attempt: i32) {
         ex.s.wft = None;
-        ex.s.sticky_queue.clear();
-        flush_buffered(ex);
-        let key = ex.key();
-        if attempt >= 3 {
-            let delay = (1000i64 << (attempt - 3).min(6)).min(60_000);
-            ex.s.wft_due_ms = now_ms() + delay;
-            ex.s.wft_due_attempt = attempt;
-            self.add_timer(ex.s.wft_due_ms, TimerKind::WftDue { key });
-        } else {
-            self.schedule_wft(ex, attempt);
-        }
+        let attempt = if flush_buffered(ex) { 1 } else { attempt };
+        self.schedule_wft(ex, attempt);
         self.requeue_queries(ex);
     }
 
@@ -700,39 +788,51 @@ impl Inner {
         }
         let mut ex = self.take(key)?;
         let w = ex.s.wft.clone().expect("checked");
-        push(
-            &mut ex,
-            A::WorkflowTaskTimedOutEventAttributes(history::WorkflowTaskTimedOutEventAttributes {
-                scheduled_event_id: w.scheduled_id,
-                started_event_id: w.started_id,
-                timeout_type: enums::TimeoutType::StartToClose as i32,
-            }),
-        );
-        self.retry_wft(&mut ex, w.attempt + 1);
+        if !w.transient {
+            push(
+                &mut ex,
+                A::WorkflowTaskTimedOutEventAttributes(history::WorkflowTaskTimedOutEventAttributes {
+                    scheduled_event_id: w.scheduled_id,
+                    started_event_id: w.started_id,
+                    timeout_type: enums::TimeoutType::StartToClose as i32,
+                }),
+            );
+        }
+        let next = next_attempt(&mut ex, &w, true);
+        self.retry_wft(&mut ex, next);
         self.put(ex);
         Ok(())
     }
 
-    /// The sticky worker didn't pick the task up in time: move it to the normal queue.
-    pub fn sticky_timed_out(&mut self, key: &Key, scheduled_id: i64) {
-        let Some(ex) = self.execs.get_mut(key) else { return };
-        let Some(w) = ex.s.wft.as_mut() else { return };
-        if w.scheduled_id != scheduled_id || w.started_id != 0 || w.queue == ex.s.task_queue {
-            return;
+    /// The sticky worker didn't pick the task up in time: record the schedule-to-start timeout
+    /// and schedule a new task on the normal queue (Go server).
+    pub fn sticky_timed_out(&mut self, key: &Key, scheduled_id: i64) -> R<()> {
+        let Some(ex) = self.execs.get(key) else { return Ok(()) };
+        let valid = ex.s.is_open()
+            && ex
+                .s
+                .wft
+                .as_ref()
+                .is_some_and(|w| w.scheduled_id == scheduled_id && w.started_id == 0 && w.queue != ex.s.task_queue);
+        if !valid {
+            return Ok(());
         }
-        w.queue = ex.s.task_queue.clone();
-        ex.s.sticky_queue.clear();
-        let tq = ex.s.task_queue.clone();
-        self.dirty.insert(key.clone());
-        self.enqueue(
-            &key.0,
-            &tq,
-            QKind::Workflow,
-            TaskRef::Wft {
-                run_id: key.1.clone(),
-                scheduled_id,
-            },
-        );
+        let mut ex = self.take(key)?;
+        let w = ex.s.wft.clone().expect("checked");
+        if !w.transient {
+            push(
+                &mut ex,
+                A::WorkflowTaskTimedOutEventAttributes(history::WorkflowTaskTimedOutEventAttributes {
+                    scheduled_event_id: w.scheduled_id,
+                    started_event_id: 0,
+                    timeout_type: enums::TimeoutType::ScheduleToStart as i32,
+                }),
+            );
+        }
+        let next = next_attempt(&mut ex, &w, false);
+        self.retry_wft(&mut ex, next);
+        self.put(ex);
+        Ok(())
     }
 
     pub fn wft_due(&mut self, key: &Key) -> R<()> {
@@ -775,71 +875,207 @@ impl Inner {
     }
 }
 
-fn validate_commands(
-    ex: &Execution,
-    cmds: &[command::Command],
-) -> Result<(), (enums::WorkflowTaskFailedCause, String)> {
+/// Why a completion is refused.
+pub struct Reject {
+    pub cause: enums::WorkflowTaskFailedCause,
+    pub msg: String,
+    /// Oversized payloads terminate the workflow instead of retrying the task.
+    pub terminate: bool,
+}
+
+#[derive(Default)]
+struct CommandEffect {
+    /// The workflow needs another task (e.g. it cancelled an activity that hadn't started).
+    new_task: bool,
+    /// An activity to start in the completion response.
+    eager_activity: Option<i64>,
+}
+
+/// The attempt after a failure: back to 1 (and off the sticky queue) if the task was sticky,
+/// otherwise one more when `increment` (Go server's failWorkflowTask).
+fn next_attempt(ex: &mut Execution, w: &crate::state::WftInfo, increment: bool) -> i32 {
+    if !ex.s.sticky_queue.is_empty() {
+        ex.s.sticky_queue.clear();
+        return 1;
+    }
+    if increment { w.attempt + 1 } else { 1 }
+}
+
+fn payloads_size(p: &Option<common::Payloads>) -> usize {
+    p.as_ref().map(|p| p.encoded_len()).unwrap_or(0)
+}
+
+fn validate_commands(ex: &Execution, cmds: &[command::Command]) -> Result<(), Reject> {
     use enums::WorkflowTaskFailedCause as F;
+    let fail = |cause: F, msg: String| Reject {
+        cause,
+        msg,
+        terminate: false,
+    };
+    let too_big = |cause: F, msg: &str| Reject {
+        cause,
+        msg: msg.to_string(),
+        terminate: true,
+    };
     let mut activity_ids: std::collections::HashSet<String> =
         ex.s.activities
             .values()
             .filter_map(|a| a.attrs.as_ref().map(|x| x.activity_id.clone()))
             .collect();
     let mut timer_ids: std::collections::HashSet<String> = ex.s.timers.keys().cloned().collect();
+    let mut pending_activities = ex.s.activities.len();
+    let mut pending_children = ex.s.children.len();
     for c in cmds {
         match &c.attributes {
             Some(C::ScheduleActivityTaskCommandAttributes(a)) => {
                 if a.activity_id.is_empty() {
-                    return Err((F::BadScheduleActivityAttributes, "ActivityId is not set.".into()));
+                    return Err(fail(F::BadScheduleActivityAttributes, "ActivityId is not set.".into()));
                 }
                 if a.activity_type.as_ref().is_none_or(|t| t.name.is_empty()) {
-                    return Err((F::BadScheduleActivityAttributes, "ActivityType is not set.".into()));
+                    return Err(fail(
+                        F::BadScheduleActivityAttributes,
+                        "ActivityType is not set.".into(),
+                    ));
                 }
                 if dur_ms(&a.schedule_to_close_timeout) <= 0
                     && dur_ms(&a.start_to_close_timeout) <= 0
                     && dur_ms(&ex.s.run_timeout) <= 0
                 {
-                    return Err((
+                    return Err(fail(
                         F::BadScheduleActivityAttributes,
                         "A valid StartToClose or ScheduleToCloseTimeout is not set on ScheduleActivityTaskCommand."
                             .into(),
                     ));
                 }
                 if !activity_ids.insert(a.activity_id.clone()) {
-                    return Err((
-                        F::BadScheduleActivityAttributes,
+                    return Err(fail(
+                        F::ScheduleActivityDuplicateId,
                         format!("Activity id {} is already in use.", a.activity_id),
                     ));
                 }
+                if payloads_size(&a.input) > BLOB_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadScheduleActivityAttributes,
+                        "ScheduleActivityTaskCommandAttributes.Input exceeds size limit.",
+                    ));
+                }
+                if pending_activities >= PENDING_ACTIVITIES_LIMIT {
+                    return Err(fail(
+                        F::PendingActivitiesLimitExceeded,
+                        format!(
+                            "the number of pending activities, {pending_activities}, has reached the per-workflow limit of {PENDING_ACTIVITIES_LIMIT}"
+                        ),
+                    ));
+                }
+                pending_activities += 1;
             }
             Some(C::StartTimerCommandAttributes(a)) => {
                 if a.timer_id.is_empty() {
-                    return Err((F::BadStartTimerAttributes, "TimerId is not set.".into()));
+                    return Err(fail(F::BadStartTimerAttributes, "TimerId is not set.".into()));
                 }
                 if !timer_ids.insert(a.timer_id.clone()) {
-                    return Err((
+                    return Err(fail(
                         F::StartTimerDuplicateId,
                         format!("Timer id {} is already in use.", a.timer_id),
                     ));
                 }
             }
+            Some(C::CompleteWorkflowExecutionCommandAttributes(a)) => {
+                if payloads_size(&a.result) > BLOB_SIZE_LIMIT {
+                    // The Go server reports this cause for an oversized result.
+                    return Err(too_big(
+                        F::BadScheduleActivityAttributes,
+                        "CompleteWorkflowExecutionCommandAttributes.Result exceeds size limit.",
+                    ));
+                }
+            }
+            Some(C::FailWorkflowExecutionCommandAttributes(a)) => {
+                if a.failure.as_ref().map(|f| f.encoded_len()).unwrap_or(0) > BLOB_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadFailWorkflowExecutionAttributes,
+                        "FailWorkflowExecutionCommandAttributes.Failure exceeds size limit.",
+                    ));
+                }
+            }
+            Some(C::RecordMarkerCommandAttributes(a)) => {
+                let size: usize = a.details.values().map(|p| p.encoded_len()).sum();
+                if size > BLOB_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadRecordMarkerAttributes,
+                        "RecordMarkerCommandAttributes.Details exceeds size limit.",
+                    ));
+                }
+            }
+            Some(C::ContinueAsNewWorkflowExecutionCommandAttributes(a)) => {
+                if payloads_size(&a.input) > BLOB_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadContinueAsNewAttributes,
+                        "ContinueAsNewWorkflowExecutionCommandAttributes. Input exceeds size limit.",
+                    ));
+                }
+                if a.memo.as_ref().map(|m| m.encoded_len()).unwrap_or(0) > MEMO_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadContinueAsNewAttributes,
+                        "ContinueAsNewWorkflowExecutionCommandAttributes. Memo exceeds size limit.",
+                    ));
+                }
+            }
             Some(C::StartChildWorkflowExecutionCommandAttributes(a)) => {
                 if a.workflow_id.is_empty() || a.workflow_type.as_ref().is_none_or(|t| t.name.is_empty()) {
-                    return Err((
+                    return Err(fail(
                         F::BadStartChildExecutionAttributes,
                         "Child workflow id and type must be set.".into(),
                     ));
                 }
+                if payloads_size(&a.input) > BLOB_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadStartChildExecutionAttributes,
+                        "StartChildWorkflowExecutionCommandAttributes. Input exceeds size limit.",
+                    ));
+                }
+                if pending_children >= PENDING_CHILDREN_LIMIT {
+                    return Err(fail(
+                        F::PendingChildWorkflowsLimitExceeded,
+                        format!(
+                            "the number of pending child workflows, {pending_children}, has reached the per-workflow limit of {PENDING_CHILDREN_LIMIT}"
+                        ),
+                    ));
+                }
+                pending_children += 1;
+            }
+            Some(C::SignalExternalWorkflowExecutionCommandAttributes(a)) => {
+                if payloads_size(&a.input) > BLOB_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadSignalWorkflowExecutionAttributes,
+                        "SignalExternalWorkflowExecutionCommandAttributes.Input exceeds size limit.",
+                    ));
+                }
+            }
+            Some(C::UpsertWorkflowSearchAttributesCommandAttributes(a)) => {
+                if a.search_attributes.as_ref().map(|x| x.encoded_len()).unwrap_or(0) > BLOB_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadSearchAttributes,
+                        "UpsertWorkflowSearchAttributesCommandAttributes exceeds size limit.",
+                    ));
+                }
+            }
+            Some(C::ModifyWorkflowPropertiesCommandAttributes(a)) => {
+                if a.upserted_memo.as_ref().map(|x| x.encoded_len()).unwrap_or(0) > MEMO_SIZE_LIMIT {
+                    return Err(too_big(
+                        F::BadModifyWorkflowPropertiesAttributes,
+                        "ModifyWorkflowPropertiesCommandAttributes exceeds size limit.",
+                    ));
+                }
             }
             Some(C::ProtocolMessageCommandAttributes(_)) => {
-                return Err((
+                return Err(fail(
                     F::BadUpdateWorkflowExecutionMessage,
                     "Workflow updates are not supported by this server yet.".into(),
                 ));
             }
             Some(C::ScheduleNexusOperationCommandAttributes(_))
             | Some(C::RequestCancelNexusOperationCommandAttributes(_)) => {
-                return Err((
+                return Err(fail(
                     F::BadScheduleNexusOperationAttributes,
                     "Nexus operations are not supported by this server yet.".into(),
                 ));

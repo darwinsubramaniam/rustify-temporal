@@ -243,7 +243,9 @@ impl WorkflowService for Svc {
             })
         };
         if !r.wait_new_event {
-            let (events, _, _) = self.engine.lock().history_from(&key, from, close_only)?;
+            let page = self.engine.lock().history_from(&key, from, close_only)?;
+            let mut events = page.events;
+            events.extend(page.transient);
             return Ok(resp(events, vec![]));
         }
         let got = self
@@ -252,13 +254,17 @@ impl WorkflowService for Svc {
                 timeout,
                 |i| i.notify_of_run(&key),
                 |i| {
-                    let (events, closed, next) = i.history_from(&key, from, close_only)?;
+                    let page = i.history_from(&key, from, close_only)?;
+                    let (mut events, closed, next) = (page.events, page.closed, page.next);
                     if close_only {
                         return Ok(if closed { Some((events, vec![])) } else { None });
                     }
                     if events.is_empty() {
                         return Ok(if closed { Some((events, vec![])) } else { None });
                     }
+                    // Unwritten retry events go along with new written events (never alone, or a
+                    // waiting reader would be woken over and over).
+                    events.extend(page.transient);
                     let token = if closed { vec![] } else { next.to_string().into_bytes() };
                     Ok(Some((events, token)))
                 },

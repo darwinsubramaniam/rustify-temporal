@@ -79,7 +79,7 @@ impl Inner {
                 scheduled_id,
                 started_id,
             } => self.wft_timed_out(&key, scheduled_id, started_id)?,
-            TimerKind::StickyTimeout { key, scheduled_id } => self.sticky_timed_out(&key, scheduled_id),
+            TimerKind::StickyTimeout { key, scheduled_id } => self.sticky_timed_out(&key, scheduled_id)?,
             TimerKind::WftDue { key } => self.wft_due(&key)?,
             TimerKind::ActRetry {
                 key,
