@@ -34,8 +34,12 @@ pub fn event_type(a: &A) -> enums::EventType {
         A::WorkflowExecutionTerminatedEventAttributes(_) => E::WorkflowExecutionTerminated,
         A::WorkflowExecutionCancelRequestedEventAttributes(_) => E::WorkflowExecutionCancelRequested,
         A::WorkflowExecutionCanceledEventAttributes(_) => E::WorkflowExecutionCanceled,
-        A::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(_) => E::RequestCancelExternalWorkflowExecutionInitiated,
-        A::RequestCancelExternalWorkflowExecutionFailedEventAttributes(_) => E::RequestCancelExternalWorkflowExecutionFailed,
+        A::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(_) => {
+            E::RequestCancelExternalWorkflowExecutionInitiated
+        }
+        A::RequestCancelExternalWorkflowExecutionFailedEventAttributes(_) => {
+            E::RequestCancelExternalWorkflowExecutionFailed
+        }
         A::ExternalWorkflowExecutionCancelRequestedEventAttributes(_) => E::ExternalWorkflowExecutionCancelRequested,
         A::WorkflowExecutionContinuedAsNewEventAttributes(_) => E::WorkflowExecutionContinuedAsNew,
         A::StartChildWorkflowExecutionInitiatedEventAttributes(_) => E::StartChildWorkflowExecutionInitiated,
@@ -161,14 +165,26 @@ impl Inner {
     /// Schedule a workflow task (on the sticky queue when the worker asked for one).
     pub fn schedule_wft(&mut self, ex: &mut Execution, attempt: i32) {
         let sticky = !ex.s.sticky_queue.is_empty();
-        let queue = if sticky { ex.s.sticky_queue.clone() } else { ex.s.task_queue.clone() };
+        let queue = if sticky {
+            ex.s.sticky_queue.clone()
+        } else {
+            ex.s.task_queue.clone()
+        };
         let timeout = {
             let t = dur_ms(&ex.s.wft_timeout);
-            if t <= 0 { DEFAULT_WFT_TIMEOUT_MS } else { t.min(MAX_WFT_TIMEOUT_MS) }
+            if t <= 0 {
+                DEFAULT_WFT_TIMEOUT_MS
+            } else {
+                t.min(MAX_WFT_TIMEOUT_MS)
+            }
         };
         let tq = taskqueue::TaskQueue {
             name: queue.clone(),
-            kind: if sticky { enums::TaskQueueKind::Sticky as i32 } else { enums::TaskQueueKind::Normal as i32 },
+            kind: if sticky {
+                enums::TaskQueueKind::Sticky as i32
+            } else {
+                enums::TaskQueueKind::Normal as i32
+            },
             normal_name: if sticky { ex.s.task_queue.clone() } else { String::new() },
         };
         let sid = push(
@@ -192,9 +208,21 @@ impl Inner {
             original_scheduled_ms: now,
         });
         let key = ex.key();
-        self.enqueue(&key.0, &queue, QKind::Workflow, TaskRef::Wft { run_id: key.1.clone(), scheduled_id: sid });
+        self.enqueue(
+            &key.0,
+            &queue,
+            QKind::Workflow,
+            TaskRef::Wft {
+                run_id: key.1.clone(),
+                scheduled_id: sid,
+            },
+        );
         if sticky {
-            let st = if ex.s.sticky_timeout_ms > 0 { ex.s.sticky_timeout_ms } else { DEFAULT_STICKY_TIMEOUT_MS };
+            let st = if ex.s.sticky_timeout_ms > 0 {
+                ex.s.sticky_timeout_ms
+            } else {
+                DEFAULT_STICKY_TIMEOUT_MS
+            };
             self.add_timer(now + st, TimerKind::StickyTimeout { key, scheduled_id: sid });
         }
     }
@@ -209,19 +237,19 @@ impl Inner {
     /// Before force-closing a run (terminate, timeout), close out a running workflow task and
     /// write anything held back.
     pub fn force_close_wft(&mut self, ex: &mut Execution) {
-        if let Some(w) = ex.s.wft.clone() {
-            if w.started_id > 0 {
-                push(
-                    ex,
-                    A::WorkflowTaskFailedEventAttributes(history::WorkflowTaskFailedEventAttributes {
-                        scheduled_event_id: w.scheduled_id,
-                        started_event_id: w.started_id,
-                        cause: enums::WorkflowTaskFailedCause::ForceCloseCommand as i32,
-                        identity: "server".into(),
-                        ..Default::default()
-                    }),
-                );
-            }
+        if let Some(w) = ex.s.wft.clone()
+            && w.started_id > 0
+        {
+            push(
+                ex,
+                A::WorkflowTaskFailedEventAttributes(history::WorkflowTaskFailedEventAttributes {
+                    scheduled_event_id: w.scheduled_id,
+                    started_event_id: w.started_id,
+                    cause: enums::WorkflowTaskFailedCause::ForceCloseCommand as i32,
+                    identity: "server".into(),
+                    ..Default::default()
+                }),
+            );
         }
         ex.s.wft = None;
         ex.s.wft_due_ms = 0;

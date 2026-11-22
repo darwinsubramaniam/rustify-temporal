@@ -18,10 +18,10 @@ import (
 
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
-	"google.golang.org/protobuf/types/known/durationpb"
 	sdklog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const tq = "bench"

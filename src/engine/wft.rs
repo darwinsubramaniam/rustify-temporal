@@ -8,14 +8,21 @@ use history::history_event::Attributes as A;
 
 impl Inner {
     /// Try to start one task from a workflow task queue.
-    pub fn take_wft(&mut self, ns: &str, queue: &str, identity: &str) -> R<Option<wsv1::PollWorkflowTaskQueueResponse>> {
+    pub fn take_wft(
+        &mut self,
+        ns: &str,
+        queue: &str,
+        identity: &str,
+    ) -> R<Option<wsv1::PollWorkflowTaskQueueResponse>> {
         loop {
             let t = match self.queue(ns, queue, QKind::Workflow).tasks.pop_front() {
                 Some(t) => t,
                 None => return Ok(None),
             };
             let r = match t {
-                TaskRef::Wft { run_id, scheduled_id } => self.start_wft(&(ns.to_string(), run_id), scheduled_id, queue, identity)?,
+                TaskRef::Wft { run_id, scheduled_id } => {
+                    self.start_wft(&(ns.to_string(), run_id), scheduled_id, queue, identity)?
+                }
                 TaskRef::Query { query_id } => self.start_query_task(&query_id, queue)?,
                 TaskRef::Activity { .. } => None,
             };
@@ -26,9 +33,20 @@ impl Inner {
     }
 
     /// Mark the workflow task started and build what the worker receives.
-    pub fn start_wft(&mut self, key: &Key, scheduled_id: i64, queue: &str, identity: &str) -> R<Option<wsv1::PollWorkflowTaskQueueResponse>> {
+    pub fn start_wft(
+        &mut self,
+        key: &Key,
+        scheduled_id: i64,
+        queue: &str,
+        identity: &str,
+    ) -> R<Option<wsv1::PollWorkflowTaskQueueResponse>> {
         let Some(ex) = self.execs.get(key) else { return Ok(None) };
-        let valid = ex.s.is_open() && ex.s.wft.as_ref().is_some_and(|w| w.scheduled_id == scheduled_id && w.started_id == 0 && w.queue == queue);
+        let valid = ex.s.is_open()
+            && ex
+                .s
+                .wft
+                .as_ref()
+                .is_some_and(|w| w.scheduled_id == scheduled_id && w.started_id == 0 && w.queue == queue);
         if !valid {
             return Ok(None);
         }
@@ -51,7 +69,14 @@ impl Inner {
         w.started_ms = now;
         w.request_id = request_id;
         let (attempt, timeout, sched_ms) = (w.attempt, w.timeout_ms, w.scheduled_ms);
-        self.add_timer(now + timeout, TimerKind::WftTimeout { key: key.clone(), scheduled_id, started_id });
+        self.add_timer(
+            now + timeout,
+            TimerKind::WftTimeout {
+                key: key.clone(),
+                scheduled_id,
+                started_id,
+            },
+        );
         let sticky = !ex.s.sticky_queue.is_empty() && ex.s.sticky_queue == queue;
         let first = if sticky { ex.s.last_completed_started_id + 1 } else { 1 };
         let events: Vec<_> = ex.events.iter().filter(|e| e.event_id >= first).cloned().collect();
@@ -68,8 +93,13 @@ impl Inner {
         };
         let resp = wsv1::PollWorkflowTaskQueueResponse {
             task_token: token.encode(),
-            workflow_execution: Some(common::WorkflowExecution { workflow_id: ex.s.workflow_id.clone(), run_id: key.1.clone() }),
-            workflow_type: Some(common::WorkflowType { name: ex.s.workflow_type.clone() }),
+            workflow_execution: Some(common::WorkflowExecution {
+                workflow_id: ex.s.workflow_id.clone(),
+                run_id: key.1.clone(),
+            }),
+            workflow_type: Some(common::WorkflowType {
+                name: ex.s.workflow_type.clone(),
+            }),
             previous_started_event_id: ex.s.last_completed_started_id,
             started_event_id: started_id,
             attempt,
@@ -96,7 +126,12 @@ impl Inner {
         }
         let ok = {
             let ex = &self.execs[&key];
-            ex.s.is_open() && ex.s.wft.as_ref().is_some_and(|w| w.scheduled_id == tok.sid && w.started_id == tok.st && w.started_id > 0)
+            ex.s.is_open()
+                && ex
+                    .s
+                    .wft
+                    .as_ref()
+                    .is_some_and(|w| w.scheduled_id == tok.sid && w.started_id == tok.st && w.started_id > 0)
         };
         if !ok {
             return Err(task_not_found());
@@ -104,7 +139,10 @@ impl Inner {
         self.take(&key)
     }
 
-    pub fn respond_wft_completed(&mut self, r: wsv1::RespondWorkflowTaskCompletedRequest) -> R<wsv1::RespondWorkflowTaskCompletedResponse> {
+    pub fn respond_wft_completed(
+        &mut self,
+        r: wsv1::RespondWorkflowTaskCompletedRequest,
+    ) -> R<wsv1::RespondWorkflowTaskCompletedResponse> {
         let tok = TaskToken::decode(&r.task_token)?;
         if tok.k != "wft" {
             return Err(invalid("Not a workflow task token."));
@@ -114,6 +152,20 @@ impl Inner {
         let w = ex.s.wft.clone().expect("checked");
 
         self.answer_queries(&key, &r.query_results);
+
+        // A build marked bad in the namespace can't complete workflow tasks (like the Go server).
+        if self.is_bad_binary(&key.0, &r.binary_checksum) {
+            let msg = format!("binary {} is marked as bad deployment", r.binary_checksum);
+            self.fail_wft_inner(
+                &mut ex,
+                enums::WorkflowTaskFailedCause::BadBinary,
+                Some(server_failure(&msg, true)),
+                &r.identity,
+                true,
+            );
+            self.put(ex);
+            return Err(invalid(msg));
+        }
 
         // Validate commands first so a bad one fails the task without partial writes.
         if let Err((cause, msg)) = validate_commands(&ex, &r.commands) {
@@ -132,7 +184,13 @@ impl Inner {
             )
         });
         if closes && !ex.s.buffered.is_empty() {
-            self.fail_wft_inner(&mut ex, enums::WorkflowTaskFailedCause::UnhandledCommand, None, &r.identity, false);
+            self.fail_wft_inner(
+                &mut ex,
+                enums::WorkflowTaskFailedCause::UnhandledCommand,
+                None,
+                &r.identity,
+                false,
+            );
             self.put(ex);
             return Ok(Default::default());
         }
@@ -146,7 +204,7 @@ impl Inner {
                 binary_checksum: r.binary_checksum.clone(),
                 worker_version: r.worker_version_stamp.clone(),
                 sdk_metadata: r.sdk_metadata.clone(),
-                metering_metadata: r.metering_metadata.clone(),
+                metering_metadata: r.metering_metadata,
                 deployment: r.deployment.clone(),
                 versioning_behavior: r.versioning_behavior,
                 ..Default::default()
@@ -154,7 +212,11 @@ impl Inner {
         );
         ex.s.last_completed_started_id = w.started_id;
         ex.s.wft = None;
-        match r.sticky_attributes.as_ref().and_then(|s| s.worker_task_queue.as_ref().map(|q| (q.name.clone(), dur_ms(&s.schedule_to_start_timeout)))) {
+        match r.sticky_attributes.as_ref().and_then(|s| {
+            s.worker_task_queue
+                .as_ref()
+                .map(|q| (q.name.clone(), dur_ms(&s.schedule_to_start_timeout)))
+        }) {
             Some((name, t)) if !name.is_empty() => {
                 ex.s.sticky_queue = name;
                 ex.s.sticky_timeout_ms = t;
@@ -171,12 +233,12 @@ impl Inner {
             let Some(a) = c.attributes else { continue };
             let user_metadata = c.user_metadata;
             self.apply_command(&mut ex, a, completed_id, &r.identity)?;
-            if user_metadata.is_some() {
-                if let Some(last) = ex.events.last_mut() {
-                    if last.event_id > completed_id && last.user_metadata.is_none() {
-                        last.user_metadata = user_metadata;
-                    }
-                }
+            if user_metadata.is_some()
+                && let Some(last) = ex.events.last_mut()
+                && last.event_id > completed_id
+                && last.user_metadata.is_none()
+            {
+                last.user_metadata = user_metadata;
             }
         }
 
@@ -199,7 +261,11 @@ impl Inner {
             self.requeue_queries(&ex);
         }
         self.put(ex);
-        Ok(wsv1::RespondWorkflowTaskCompletedResponse { workflow_task: new_task, activity_tasks: vec![], reset_history_event_id: 0 })
+        Ok(wsv1::RespondWorkflowTaskCompletedResponse {
+            workflow_task: new_task,
+            activity_tasks: vec![],
+            reset_history_event_id: 0,
+        })
     }
 
     fn apply_command(&mut self, ex: &mut Execution, a: C, completed_id: i64, identity: &str) -> R<()> {
@@ -261,12 +327,34 @@ impl Inner {
                         ..Default::default()
                     },
                 );
-                self.enqueue(&key.0, &tq.name, QKind::Activity, TaskRef::Activity { run_id: key.1.clone(), scheduled_id: sid, attempt: 1 });
+                self.enqueue(
+                    &key.0,
+                    &tq.name,
+                    QKind::Activity,
+                    TaskRef::Activity {
+                        run_id: key.1.clone(),
+                        scheduled_id: sid,
+                        attempt: 1,
+                    },
+                );
                 if s2s > 0 && s2s < s2c {
-                    self.add_timer(now + s2s, TimerKind::ActScheduleToStart { key: key.clone(), scheduled_id: sid, attempt: 1 });
+                    self.add_timer(
+                        now + s2s,
+                        TimerKind::ActScheduleToStart {
+                            key: key.clone(),
+                            scheduled_id: sid,
+                            attempt: 1,
+                        },
+                    );
                 }
                 if expiration > 0 {
-                    self.add_timer(expiration, TimerKind::ActScheduleToClose { key: key.clone(), scheduled_id: sid });
+                    self.add_timer(
+                        expiration,
+                        TimerKind::ActScheduleToClose {
+                            key: key.clone(),
+                            scheduled_id: sid,
+                        },
+                    );
                 }
             }
             C::RequestCancelActivityTaskCommandAttributes(c) => {
@@ -274,10 +362,12 @@ impl Inner {
                 if let Some(act) = ex.s.activities.get(&sid).cloned() {
                     let cr = push(
                         ex,
-                        A::ActivityTaskCancelRequestedEventAttributes(history::ActivityTaskCancelRequestedEventAttributes {
-                            scheduled_event_id: sid,
-                            workflow_task_completed_event_id: completed_id,
-                        }),
+                        A::ActivityTaskCancelRequestedEventAttributes(
+                            history::ActivityTaskCancelRequestedEventAttributes {
+                                scheduled_event_id: sid,
+                                workflow_task_completed_event_id: completed_id,
+                            },
+                        ),
                     );
                     if act.state == crate::state::ACT_STARTED {
                         let a = ex.s.activities.get_mut(&sid).expect("present");
@@ -310,8 +400,22 @@ impl Inner {
                     }),
                 );
                 let fire = now_ms() + ms;
-                ex.s.timers.insert(c.timer_id.clone(), TimerInfo { timer_id: c.timer_id.clone(), started_id: sid, fire_ms: fire });
-                self.add_timer(fire, TimerKind::User { key, timer_id: c.timer_id, started_id: sid });
+                ex.s.timers.insert(
+                    c.timer_id.clone(),
+                    TimerInfo {
+                        timer_id: c.timer_id.clone(),
+                        started_id: sid,
+                        fire_ms: fire,
+                    },
+                );
+                self.add_timer(
+                    fire,
+                    TimerKind::User {
+                        key,
+                        timer_id: c.timer_id,
+                        started_id: sid,
+                    },
+                );
             }
             C::CancelTimerCommandAttributes(c) => {
                 if let Some(t) = ex.s.timers.remove(&c.timer_id) {
@@ -378,10 +482,12 @@ impl Inner {
                 }
                 push(
                     ex,
-                    A::UpsertWorkflowSearchAttributesEventAttributes(history::UpsertWorkflowSearchAttributesEventAttributes {
-                        workflow_task_completed_event_id: completed_id,
-                        search_attributes: c.search_attributes,
-                    }),
+                    A::UpsertWorkflowSearchAttributesEventAttributes(
+                        history::UpsertWorkflowSearchAttributesEventAttributes {
+                            workflow_task_completed_event_id: completed_id,
+                            search_attributes: c.search_attributes,
+                        },
+                    ),
                 );
             }
             C::ModifyWorkflowPropertiesCommandAttributes(c) => {
@@ -404,7 +510,11 @@ impl Inner {
                 );
             }
             C::StartChildWorkflowExecutionCommandAttributes(c) => {
-                let ns = if c.namespace.is_empty() { key.0.clone() } else { c.namespace.clone() };
+                let ns = if c.namespace.is_empty() {
+                    key.0.clone()
+                } else {
+                    c.namespace.clone()
+                };
                 let ns_id = self.ns_id(&ns).unwrap_or_default();
                 let mut tq = c.task_queue.clone().unwrap_or_default();
                 if tq.name.is_empty() {
@@ -434,7 +544,10 @@ impl Inner {
                     priority: c.priority,
                     ..Default::default()
                 };
-                let iid = push(ex, A::StartChildWorkflowExecutionInitiatedEventAttributes(attrs.clone()));
+                let iid = push(
+                    ex,
+                    A::StartChildWorkflowExecutionInitiatedEventAttributes(attrs.clone()),
+                );
                 ex.s.children.insert(
                     iid,
                     ChildInfo {
@@ -447,10 +560,18 @@ impl Inner {
                         parent_close_policy: c.parent_close_policy,
                     },
                 );
-                self.actions.push_back(Action::StartChild { parent: key, initiated_id: iid, attrs });
+                self.actions.push_back(Action::StartChild {
+                    parent: key,
+                    initiated_id: iid,
+                    attrs,
+                });
             }
             C::SignalExternalWorkflowExecutionCommandAttributes(c) => {
-                let ns = if c.namespace.is_empty() { key.0.clone() } else { c.namespace.clone() };
+                let ns = if c.namespace.is_empty() {
+                    key.0.clone()
+                } else {
+                    c.namespace.clone()
+                };
                 let ns_id = self.ns_id(&ns).unwrap_or_default();
                 let attrs = history::SignalExternalWorkflowExecutionInitiatedEventAttributes {
                     workflow_task_completed_event_id: completed_id,
@@ -463,24 +584,46 @@ impl Inner {
                     child_workflow_only: c.child_workflow_only,
                     header: c.header,
                 };
-                let iid = push(ex, A::SignalExternalWorkflowExecutionInitiatedEventAttributes(attrs.clone()));
+                let iid = push(
+                    ex,
+                    A::SignalExternalWorkflowExecutionInitiatedEventAttributes(attrs.clone()),
+                );
                 let request_id = format!("{}:{}", key.1, iid);
-                self.actions.push_back(Action::SignalExternal { source: key, initiated_id: iid, attrs, request_id });
+                self.actions.push_back(Action::SignalExternal {
+                    source: key,
+                    initiated_id: iid,
+                    attrs,
+                    request_id,
+                });
             }
             C::RequestCancelExternalWorkflowExecutionCommandAttributes(c) => {
-                let ns = if c.namespace.is_empty() { key.0.clone() } else { c.namespace.clone() };
+                let ns = if c.namespace.is_empty() {
+                    key.0.clone()
+                } else {
+                    c.namespace.clone()
+                };
                 let ns_id = self.ns_id(&ns).unwrap_or_default();
                 let attrs = history::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes {
                     workflow_task_completed_event_id: completed_id,
                     namespace: ns,
                     namespace_id: ns_id,
-                    workflow_execution: Some(common::WorkflowExecution { workflow_id: c.workflow_id, run_id: c.run_id }),
+                    workflow_execution: Some(common::WorkflowExecution {
+                        workflow_id: c.workflow_id,
+                        run_id: c.run_id,
+                    }),
                     control: c.control,
                     child_workflow_only: c.child_workflow_only,
                     reason: c.reason,
                 };
-                let iid = push(ex, A::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(attrs.clone()));
-                self.actions.push_back(Action::CancelExternal { source: key, initiated_id: iid, attrs });
+                let iid = push(
+                    ex,
+                    A::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(attrs.clone()),
+                );
+                self.actions.push_back(Action::CancelExternal {
+                    source: key,
+                    initiated_id: iid,
+                    attrs,
+                });
             }
             _ => {}
         }
@@ -490,14 +633,22 @@ impl Inner {
     pub fn respond_wft_failed(&mut self, r: wsv1::RespondWorkflowTaskFailedRequest) -> R<()> {
         let tok = TaskToken::decode(&r.task_token)?;
         let mut ex = self.check_wft_token(&tok)?;
-        let cause = enums::WorkflowTaskFailedCause::try_from(r.cause).unwrap_or(enums::WorkflowTaskFailedCause::Unspecified);
+        let cause =
+            enums::WorkflowTaskFailedCause::try_from(r.cause).unwrap_or(enums::WorkflowTaskFailedCause::Unspecified);
         self.fail_wft_inner(&mut ex, cause, r.failure, &r.identity, true);
         self.put(ex);
         Ok(())
     }
 
     /// Record a failed workflow task and schedule the next attempt.
-    fn fail_wft_inner(&mut self, ex: &mut Execution, cause: enums::WorkflowTaskFailedCause, f: Option<failure::Failure>, identity: &str, count_attempt: bool) {
+    fn fail_wft_inner(
+        &mut self,
+        ex: &mut Execution,
+        cause: enums::WorkflowTaskFailedCause,
+        f: Option<failure::Failure>,
+        identity: &str,
+        count_attempt: bool,
+    ) {
         let w = ex.s.wft.clone().expect("running task");
         push(
             ex,
@@ -510,7 +661,11 @@ impl Inner {
                 ..Default::default()
             }),
         );
-        let next_attempt = if count_attempt && cause != enums::WorkflowTaskFailedCause::ResetStickyTaskQueue { w.attempt + 1 } else { 1 };
+        let next_attempt = if count_attempt && cause != enums::WorkflowTaskFailedCause::ResetStickyTaskQueue {
+            w.attempt + 1
+        } else {
+            1
+        };
         self.retry_wft(ex, next_attempt);
     }
 
@@ -534,7 +689,12 @@ impl Inner {
 
     pub fn wft_timed_out(&mut self, key: &Key, scheduled_id: i64, started_id: i64) -> R<()> {
         let Some(ex) = self.execs.get(key) else { return Ok(()) };
-        let valid = ex.s.is_open() && ex.s.wft.as_ref().is_some_and(|w| w.scheduled_id == scheduled_id && w.started_id == started_id);
+        let valid = ex.s.is_open()
+            && ex
+                .s
+                .wft
+                .as_ref()
+                .is_some_and(|w| w.scheduled_id == scheduled_id && w.started_id == started_id);
         if !valid {
             return Ok(());
         }
@@ -564,7 +724,15 @@ impl Inner {
         ex.s.sticky_queue.clear();
         let tq = ex.s.task_queue.clone();
         self.dirty.insert(key.clone());
-        self.enqueue(&key.0, &tq, QKind::Workflow, TaskRef::Wft { run_id: key.1.clone(), scheduled_id });
+        self.enqueue(
+            &key.0,
+            &tq,
+            QKind::Workflow,
+            TaskRef::Wft {
+                run_id: key.1.clone(),
+                scheduled_id,
+            },
+        );
     }
 
     pub fn wft_due(&mut self, key: &Key) -> R<()> {
@@ -585,24 +753,38 @@ impl Inner {
         let mut ex = self.take(key)?;
         ex.s.sticky_queue.clear();
         // A task already waiting on the sticky queue goes to the normal queue.
-        if let Some(w) = ex.s.wft.as_mut() {
-            if w.started_id == 0 && w.queue != ex.s.task_queue {
-                w.queue = ex.s.task_queue.clone();
-                let sid = w.scheduled_id;
-                let tq = ex.s.task_queue.clone();
-                self.enqueue(&key.0, &tq, QKind::Workflow, TaskRef::Wft { run_id: key.1.clone(), scheduled_id: sid });
-            }
+        if let Some(w) = ex.s.wft.as_mut()
+            && w.started_id == 0
+            && w.queue != ex.s.task_queue
+        {
+            w.queue = ex.s.task_queue.clone();
+            let sid = w.scheduled_id;
+            let tq = ex.s.task_queue.clone();
+            self.enqueue(
+                &key.0,
+                &tq,
+                QKind::Workflow,
+                TaskRef::Wft {
+                    run_id: key.1.clone(),
+                    scheduled_id: sid,
+                },
+            );
         }
         self.put(ex);
         Ok(())
     }
-
 }
 
-fn validate_commands(ex: &Execution, cmds: &[command::Command]) -> Result<(), (enums::WorkflowTaskFailedCause, String)> {
+fn validate_commands(
+    ex: &Execution,
+    cmds: &[command::Command],
+) -> Result<(), (enums::WorkflowTaskFailedCause, String)> {
     use enums::WorkflowTaskFailedCause as F;
     let mut activity_ids: std::collections::HashSet<String> =
-        ex.s.activities.values().filter_map(|a| a.attrs.as_ref().map(|x| x.activity_id.clone())).collect();
+        ex.s.activities
+            .values()
+            .filter_map(|a| a.attrs.as_ref().map(|x| x.activity_id.clone()))
+            .collect();
     let mut timer_ids: std::collections::HashSet<String> = ex.s.timers.keys().cloned().collect();
     for c in cmds {
         match &c.attributes {
@@ -613,11 +795,21 @@ fn validate_commands(ex: &Execution, cmds: &[command::Command]) -> Result<(), (e
                 if a.activity_type.as_ref().is_none_or(|t| t.name.is_empty()) {
                     return Err((F::BadScheduleActivityAttributes, "ActivityType is not set.".into()));
                 }
-                if dur_ms(&a.schedule_to_close_timeout) <= 0 && dur_ms(&a.start_to_close_timeout) <= 0 && dur_ms(&ex.s.run_timeout) <= 0 {
-                    return Err((F::BadScheduleActivityAttributes, "A valid StartToClose or ScheduleToCloseTimeout is not set on ScheduleActivityTaskCommand.".into()));
+                if dur_ms(&a.schedule_to_close_timeout) <= 0
+                    && dur_ms(&a.start_to_close_timeout) <= 0
+                    && dur_ms(&ex.s.run_timeout) <= 0
+                {
+                    return Err((
+                        F::BadScheduleActivityAttributes,
+                        "A valid StartToClose or ScheduleToCloseTimeout is not set on ScheduleActivityTaskCommand."
+                            .into(),
+                    ));
                 }
                 if !activity_ids.insert(a.activity_id.clone()) {
-                    return Err((F::BadScheduleActivityAttributes, format!("Activity id {} is already in use.", a.activity_id)));
+                    return Err((
+                        F::BadScheduleActivityAttributes,
+                        format!("Activity id {} is already in use.", a.activity_id),
+                    ));
                 }
             }
             Some(C::StartTimerCommandAttributes(a)) => {
@@ -625,19 +817,32 @@ fn validate_commands(ex: &Execution, cmds: &[command::Command]) -> Result<(), (e
                     return Err((F::BadStartTimerAttributes, "TimerId is not set.".into()));
                 }
                 if !timer_ids.insert(a.timer_id.clone()) {
-                    return Err((F::StartTimerDuplicateId, format!("Timer id {} is already in use.", a.timer_id)));
+                    return Err((
+                        F::StartTimerDuplicateId,
+                        format!("Timer id {} is already in use.", a.timer_id),
+                    ));
                 }
             }
             Some(C::StartChildWorkflowExecutionCommandAttributes(a)) => {
                 if a.workflow_id.is_empty() || a.workflow_type.as_ref().is_none_or(|t| t.name.is_empty()) {
-                    return Err((F::BadStartChildExecutionAttributes, "Child workflow id and type must be set.".into()));
+                    return Err((
+                        F::BadStartChildExecutionAttributes,
+                        "Child workflow id and type must be set.".into(),
+                    ));
                 }
             }
             Some(C::ProtocolMessageCommandAttributes(_)) => {
-                return Err((F::BadUpdateWorkflowExecutionMessage, "Workflow updates are not supported by this server yet.".into()));
+                return Err((
+                    F::BadUpdateWorkflowExecutionMessage,
+                    "Workflow updates are not supported by this server yet.".into(),
+                ));
             }
-            Some(C::ScheduleNexusOperationCommandAttributes(_)) | Some(C::RequestCancelNexusOperationCommandAttributes(_)) => {
-                return Err((F::BadScheduleNexusOperationAttributes, "Nexus operations are not supported by this server yet.".into()));
+            Some(C::ScheduleNexusOperationCommandAttributes(_))
+            | Some(C::RequestCancelNexusOperationCommandAttributes(_)) => {
+                return Err((
+                    F::BadScheduleNexusOperationAttributes,
+                    "Nexus operations are not supported by this server yet.".into(),
+                ));
             }
             _ => {}
         }

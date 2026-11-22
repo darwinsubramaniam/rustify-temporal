@@ -52,29 +52,55 @@ impl Inner {
 
     fn fire(&mut self, k: TimerKind) -> R<()> {
         match k {
-            TimerKind::User { key, timer_id, started_id } => {
-                let valid = self.execs.get(&key).is_some_and(|ex| ex.s.is_open() && ex.s.timers.get(&timer_id).is_some_and(|t| t.started_id == started_id));
+            TimerKind::User {
+                key,
+                timer_id,
+                started_id,
+            } => {
+                let valid = self.execs.get(&key).is_some_and(|ex| {
+                    ex.s.is_open() && ex.s.timers.get(&timer_id).is_some_and(|t| t.started_id == started_id)
+                });
                 if valid {
                     let mut ex = self.take(&key)?;
                     ex.s.timers.remove(&timer_id);
-                    push_external(&mut ex, A::TimerFiredEventAttributes(history::TimerFiredEventAttributes { timer_id, started_event_id: started_id }));
+                    push_external(
+                        &mut ex,
+                        A::TimerFiredEventAttributes(history::TimerFiredEventAttributes {
+                            timer_id,
+                            started_event_id: started_id,
+                        }),
+                    );
                     self.ensure_wft(&mut ex);
                     self.put(ex);
                 }
             }
-            TimerKind::WftTimeout { key, scheduled_id, started_id } => self.wft_timed_out(&key, scheduled_id, started_id)?,
+            TimerKind::WftTimeout {
+                key,
+                scheduled_id,
+                started_id,
+            } => self.wft_timed_out(&key, scheduled_id, started_id)?,
             TimerKind::StickyTimeout { key, scheduled_id } => self.sticky_timed_out(&key, scheduled_id),
             TimerKind::WftDue { key } => self.wft_due(&key)?,
-            TimerKind::ActRetry { key, scheduled_id, attempt } => self.activity_retry_due(&key, scheduled_id, attempt),
-            TimerKind::ActScheduleToStart { key, scheduled_id, attempt } => {
-                self.activity_timer(&key, scheduled_id, Some(attempt), enums::TimeoutType::ScheduleToStart)?
-            }
-            TimerKind::ActStartToClose { key, scheduled_id, attempt } => {
-                self.activity_timer(&key, scheduled_id, Some(attempt), enums::TimeoutType::StartToClose)?
-            }
-            TimerKind::ActHeartbeat { key, scheduled_id, attempt } => {
-                self.activity_timer(&key, scheduled_id, Some(attempt), enums::TimeoutType::Heartbeat)?
-            }
+            TimerKind::ActRetry {
+                key,
+                scheduled_id,
+                attempt,
+            } => self.activity_retry_due(&key, scheduled_id, attempt),
+            TimerKind::ActScheduleToStart {
+                key,
+                scheduled_id,
+                attempt,
+            } => self.activity_timer(&key, scheduled_id, Some(attempt), enums::TimeoutType::ScheduleToStart)?,
+            TimerKind::ActStartToClose {
+                key,
+                scheduled_id,
+                attempt,
+            } => self.activity_timer(&key, scheduled_id, Some(attempt), enums::TimeoutType::StartToClose)?,
+            TimerKind::ActHeartbeat {
+                key,
+                scheduled_id,
+                attempt,
+            } => self.activity_timer(&key, scheduled_id, Some(attempt), enums::TimeoutType::Heartbeat)?,
             TimerKind::ActScheduleToClose { key, scheduled_id } => {
                 self.activity_timer(&key, scheduled_id, None, enums::TimeoutType::ScheduleToClose)?
             }
@@ -84,7 +110,11 @@ impl Inner {
                         return false;
                     }
                     let run = dur_ms(&ex.s.run_timeout);
-                    let mut deadline = if run > 0 { ex.s.execution_ms.max(ex.s.start_ms) + run } else { i64::MAX };
+                    let mut deadline = if run > 0 {
+                        ex.s.execution_ms.max(ex.s.start_ms) + run
+                    } else {
+                        i64::MAX
+                    };
                     if ex.s.expiration_ms > 0 {
                         deadline = deadline.min(ex.s.expiration_ms);
                     }

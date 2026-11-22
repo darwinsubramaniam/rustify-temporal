@@ -47,12 +47,37 @@ rcpu = cpu_seconds(rm["cpu_after"]) - cpu_seconds(rm["cpu_before"])
 gcpu = cpu_seconds(gm["cpu_after"]) - cpu_seconds(gm["cpu_before"])
 mb = lambda kb: kb / 1024
 res = [
-    ("Startup until accepting connections (median of 3)", f"{rm['startup_ms']} ms", f"{gm['startup_ms']} ms", ratio(rm["startup_ms"], gm["startup_ms"], False)),
-    ("Memory when idle", f"{mb(rm['idle_rss_kb']):.0f} MB", f"{mb(gm['idle_rss_kb']):.0f} MB", ratio(rm["idle_rss_kb"], gm["idle_rss_kb"], False)),
-    ("Peak memory under load", f"{mb(rm['peak_rss_kb']):.0f} MB", f"{mb(gm['peak_rss_kb']):.0f} MB", ratio(rm["peak_rss_kb"], gm["peak_rss_kb"], False)),
+    (
+        "Startup until accepting connections (median of 3)",
+        f"{rm['startup_ms']} ms",
+        f"{gm['startup_ms']} ms",
+        ratio(rm["startup_ms"], gm["startup_ms"], False),
+    ),
+    (
+        "Memory when idle",
+        f"{mb(rm['idle_rss_kb']):.0f} MB",
+        f"{mb(gm['idle_rss_kb']):.0f} MB",
+        ratio(rm["idle_rss_kb"], gm["idle_rss_kb"], False),
+    ),
+    (
+        "Peak memory under load",
+        f"{mb(rm['peak_rss_kb']):.0f} MB",
+        f"{mb(gm['peak_rss_kb']):.0f} MB",
+        ratio(rm["peak_rss_kb"], gm["peak_rss_kb"], False),
+    ),
     ("Server CPU time for the whole run", f"{rcpu:.1f} s", f"{gcpu:.1f} s", ratio(rcpu, gcpu, False)),
-    ("Database size afterwards", f"{rm['db_bytes'] / 1e6:.1f} MB", f"{gm['db_bytes'] / 1e6:.1f} MB", ratio(rm["db_bytes"], gm["db_bytes"], False)),
-    ("Program size", f"{rm['binary_bytes'] / 1e6:.0f} MB", f"{gm['binary_bytes'] / 1e6:.0f} MB", ratio(rm["binary_bytes"], gm["binary_bytes"], False)),
+    (
+        "Database size afterwards",
+        f"{rm['db_bytes'] / 1e6:.1f} MB",
+        f"{gm['db_bytes'] / 1e6:.1f} MB",
+        ratio(rm["db_bytes"], gm["db_bytes"], False),
+    ),
+    (
+        "Program size",
+        f"{rm['binary_bytes'] / 1e6:.0f} MB",
+        f"{gm['binary_bytes'] / 1e6:.0f} MB",
+        ratio(rm["binary_bytes"], gm["binary_bytes"], False),
+    ),
 ]
 go_version = subprocess.run(["go", "version"], capture_output=True, text=True).stdout.strip()
 rustc = subprocess.run(["rustc", "--version"], capture_output=True, text=True).stdout.strip()
@@ -67,7 +92,7 @@ single-process build of this repository with its `development-sqlite-file.yaml` 
 shard). Only features both servers support are measured. {n} workflows per scenario, {c} running at
 once (fan-out: a fifth of each), after a 50-workflow warm-up.
 
-Machine: {platform.machine()} {platform.system()} {platform.release()} · {go_version} · {rustc or 'rustc'}
+Machine: {platform.machine()} {platform.system()} {platform.release()} · {go_version} · {rustc or "rustc"}
 
 ## Throughput and latency
 
@@ -79,7 +104,7 @@ Machine: {platform.machine()} {platform.system()} {platform.release()} · {go_ve
 
 | Measure | rustify | Go server | Difference |
 |---|---|---|---|
-{chr(10).join(f'| {a} | {b} | {c_} | {d} |' for a, b, c_, d in res)}
+{chr(10).join(f"| {a} | {b} | {c_} | {d} |" for a, b, c_, d in res)}
 
 "Better" means faster, quicker or smaller for rustify. Latency is the time from starting a workflow
 to having its result.

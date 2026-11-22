@@ -20,8 +20,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/temporal/api/workflowservice/v1/service.proto",
                 "proto/temporal/api/operatorservice/v1/service.proto",
                 "proto/temporal/api/errordetails/v1/message.proto",
+                // The Go server's internal admin API (tdbg, `temporal operator` admin commands).
+                "proto/internal/temporal/server/api/adminservice/v1/service.proto",
             ],
-            &["proto"],
+            &["proto", "proto/internal"],
         )?;
     Ok(())
 }

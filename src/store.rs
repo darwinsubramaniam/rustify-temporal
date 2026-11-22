@@ -28,7 +28,11 @@ pub struct ListFilter {
 
 impl Store {
     pub fn open(path: &str) -> Result<Store> {
-        let conn = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
+        let conn = if path == ":memory:" {
+            Connection::open_in_memory()?
+        } else {
+            Connection::open(path)?
+        };
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -86,7 +90,9 @@ impl Store {
     }
 
     pub fn load_current(&self) -> Result<Vec<(String, String, String)>> {
-        let mut st = self.conn.prepare("SELECT namespace, workflow_id, run_id FROM current_executions")?;
+        let mut st = self
+            .conn
+            .prepare("SELECT namespace, workflow_id, run_id FROM current_executions")?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -189,7 +195,13 @@ impl Store {
         (sql, args)
     }
 
-    pub fn list(&self, ns: &str, f: &ListFilter, limit: i64, offset: i64) -> Result<Vec<workflow_pb::WorkflowExecutionInfo>> {
+    pub fn list(
+        &self,
+        ns: &str,
+        f: &ListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<workflow_pb::WorkflowExecutionInfo>> {
         let (w, mut args) = Self::where_clause(ns, f);
         let sql = format!("SELECT info FROM executions WHERE {w} ORDER BY start_ms DESC, run_id LIMIT ? OFFSET ?");
         args.push(limit.into());

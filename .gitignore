@@ -4,3 +4,4 @@
 *.db-shm
 e2e/.venv
 __pycache__/
+/.ci

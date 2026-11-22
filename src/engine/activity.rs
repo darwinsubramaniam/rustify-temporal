@@ -1,12 +1,14 @@
 //! Activity tasks: dispatch, heartbeats, completion, server-side retries and timeouts.
 
-use super::events::{push_external};
+use super::events::push_external;
 use super::workflow::{Retry, retry_decision};
 use super::*;
 use crate::state::{ACT_BACKOFF, ACT_SCHEDULED, ACT_STARTED, ActivityInfo};
 use history::history_event::Attributes as A;
 
 /// How an activity attempt ended.
+// Short-lived values passed once; boxing the large variant would only add allocations.
+#[allow(clippy::large_enum_variant)]
 pub enum ActEnd {
     Completed(Option<common::Payloads>),
     Failed(failure::Failure, Option<common::Payloads>),
@@ -15,13 +17,23 @@ pub enum ActEnd {
 }
 
 impl Inner {
-    pub fn take_activity(&mut self, ns: &str, queue: &str, identity: &str) -> R<Option<wsv1::PollActivityTaskQueueResponse>> {
+    pub fn take_activity(
+        &mut self,
+        ns: &str,
+        queue: &str,
+        identity: &str,
+    ) -> R<Option<wsv1::PollActivityTaskQueueResponse>> {
         loop {
             let t = match self.queue(ns, queue, QKind::Activity).tasks.pop_front() {
                 Some(t) => t,
                 None => return Ok(None),
             };
-            if let TaskRef::Activity { run_id, scheduled_id, attempt } = t {
+            if let TaskRef::Activity {
+                run_id,
+                scheduled_id,
+                attempt,
+            } = t
+            {
                 let key = (ns.to_string(), run_id);
                 if let Some(r) = self.start_activity(&key, scheduled_id, attempt, identity) {
                     return Ok(Some(r));
@@ -30,7 +42,13 @@ impl Inner {
         }
     }
 
-    fn start_activity(&mut self, key: &Key, sid: i64, attempt: i32, identity: &str) -> Option<wsv1::PollActivityTaskQueueResponse> {
+    fn start_activity(
+        &mut self,
+        key: &Key,
+        sid: i64,
+        attempt: i32,
+        identity: &str,
+    ) -> Option<wsv1::PollActivityTaskQueueResponse> {
         let ex = self.execs.get_mut(key)?;
         if !ex.s.is_open() {
             return None;
@@ -52,11 +70,25 @@ impl Inner {
         self.dirty.insert(key.clone());
         let st2c = dur_ms(&attrs.start_to_close_timeout);
         if st2c > 0 {
-            self.add_timer(now + st2c, TimerKind::ActStartToClose { key: key.clone(), scheduled_id: sid, attempt });
+            self.add_timer(
+                now + st2c,
+                TimerKind::ActStartToClose {
+                    key: key.clone(),
+                    scheduled_id: sid,
+                    attempt,
+                },
+            );
         }
         let hb = dur_ms(&attrs.heartbeat_timeout);
         if hb > 0 {
-            self.add_timer(now + hb, TimerKind::ActHeartbeat { key: key.clone(), scheduled_id: sid, attempt });
+            self.add_timer(
+                now + hb,
+                TimerKind::ActHeartbeat {
+                    key: key.clone(),
+                    scheduled_id: sid,
+                    attempt,
+                },
+            );
         }
         let token = TaskToken {
             k: "act".into(),
@@ -72,7 +104,10 @@ impl Inner {
             task_token: token.encode(),
             workflow_namespace: key.0.clone(),
             workflow_type: Some(common::WorkflowType { name: wtype }),
-            workflow_execution: Some(common::WorkflowExecution { workflow_id: wid, run_id: key.1.clone() }),
+            workflow_execution: Some(common::WorkflowExecution {
+                workflow_id: wid,
+                run_id: key.1.clone(),
+            }),
             activity_type: attrs.activity_type.clone(),
             activity_id: attrs.activity_id.clone(),
             header: attrs.header.clone(),
@@ -113,13 +148,21 @@ impl Inner {
         if !ex.s.is_open() {
             return Err(activity_not_found());
         }
-        let a = ex
-            .s
-            .activities
-            .values()
-            .find(|a| a.attrs.as_ref().is_some_and(|x| x.activity_id == activity_id))
-            .ok_or_else(activity_not_found)?;
-        Ok(TaskToken { k: "act".into(), ns: ns.to_string(), wid: wid.to_string(), rid: key.1.clone(), sid: a.scheduled_id, att: a.attempt, aid: activity_id.to_string(), ..Default::default() })
+        let a =
+            ex.s.activities
+                .values()
+                .find(|a| a.attrs.as_ref().is_some_and(|x| x.activity_id == activity_id))
+                .ok_or_else(activity_not_found)?;
+        Ok(TaskToken {
+            k: "act".into(),
+            ns: ns.to_string(),
+            wid: wid.to_string(),
+            rid: key.1.clone(),
+            sid: a.scheduled_id,
+            att: a.attempt,
+            aid: activity_id.to_string(),
+            ..Default::default()
+        })
     }
 
     /// Record a heartbeat; returns whether cancellation was requested.
@@ -156,10 +199,16 @@ impl Inner {
 
     /// Apply the end of an attempt: retry it, or write the final events.
     pub fn end_activity_attempt(&mut self, ex: &mut Execution, sid: i64, end: ActEnd, identity: &str) {
-        let Some(a) = ex.s.activities.get(&sid).cloned() else { return };
+        let Some(a) = ex.s.activities.get(&sid).cloned() else {
+            return;
+        };
         let key = ex.key();
         let attrs = a.attrs.clone().unwrap_or_default();
-        let identity = if identity.is_empty() { a.identity.clone() } else { identity.to_string() };
+        let identity = if identity.is_empty() {
+            a.identity.clone()
+        } else {
+            identity.to_string()
+        };
         // Failures and timeouts may be retried.
         let fail = match &end {
             ActEnd::Failed(f, _) => Some(f.clone()),
@@ -182,7 +231,14 @@ impl Inner {
                     if let ActEnd::Failed(_, Some(d)) = &end {
                         ai.heartbeat_details = Some(d.clone());
                     }
-                    self.add_timer(now + delay, TimerKind::ActRetry { key, scheduled_id: sid, attempt: next });
+                    self.add_timer(
+                        now + delay,
+                        TimerKind::ActRetry {
+                            key,
+                            scheduled_id: sid,
+                            attempt: next,
+                        },
+                    );
                     return;
                 }
                 Retry::No(rs) => retry_state = rs,
@@ -206,13 +262,15 @@ impl Inner {
             0
         };
         let ev = match end {
-            ActEnd::Completed(result) => A::ActivityTaskCompletedEventAttributes(history::ActivityTaskCompletedEventAttributes {
-                result,
-                scheduled_event_id: sid,
-                started_event_id: started_id,
-                identity,
-                worker_version: None,
-            }),
+            ActEnd::Completed(result) => {
+                A::ActivityTaskCompletedEventAttributes(history::ActivityTaskCompletedEventAttributes {
+                    result,
+                    scheduled_event_id: sid,
+                    started_event_id: started_id,
+                    identity,
+                    worker_version: None,
+                })
+            }
             ActEnd::Failed(f, _) => A::ActivityTaskFailedEventAttributes(history::ActivityTaskFailedEventAttributes {
                 failure: Some(f),
                 scheduled_event_id: sid,
@@ -221,14 +279,16 @@ impl Inner {
                 retry_state: retry_state as i32,
                 ..Default::default()
             }),
-            ActEnd::Canceled(details) => A::ActivityTaskCanceledEventAttributes(history::ActivityTaskCanceledEventAttributes {
-                details,
-                latest_cancel_requested_event_id: a.cancel_requested_event_id,
-                scheduled_event_id: sid,
-                started_event_id: started_id,
-                identity,
-                worker_version: None,
-            }),
+            ActEnd::Canceled(details) => {
+                A::ActivityTaskCanceledEventAttributes(history::ActivityTaskCanceledEventAttributes {
+                    details,
+                    latest_cancel_requested_event_id: a.cancel_requested_event_id,
+                    scheduled_event_id: sid,
+                    started_event_id: started_id,
+                    identity,
+                    worker_version: None,
+                })
+            }
             ActEnd::TimedOut(_) => {
                 let mut f = fail.expect("timeout failure");
                 // Keep the last application failure as the cause when retries ran out.
@@ -264,11 +324,27 @@ impl Inner {
         let attrs = a.attrs.clone().unwrap_or_default();
         let tq = attrs.task_queue.as_ref().map(|t| t.name.clone()).unwrap_or_default();
         self.dirty.insert(key.clone());
-        self.enqueue(&key.0, &tq, QKind::Activity, TaskRef::Activity { run_id: key.1.clone(), scheduled_id: sid, attempt });
+        self.enqueue(
+            &key.0,
+            &tq,
+            QKind::Activity,
+            TaskRef::Activity {
+                run_id: key.1.clone(),
+                scheduled_id: sid,
+                attempt,
+            },
+        );
         let s2s = dur_ms(&attrs.schedule_to_start_timeout);
         let s2c = dur_ms(&attrs.schedule_to_close_timeout);
         if s2s > 0 && (s2c <= 0 || s2s < s2c) {
-            self.add_timer(now + s2s, TimerKind::ActScheduleToStart { key: key.clone(), scheduled_id: sid, attempt });
+            self.add_timer(
+                now + s2s,
+                TimerKind::ActScheduleToStart {
+                    key: key.clone(),
+                    scheduled_id: sid,
+                    attempt,
+                },
+            );
         }
     }
 
@@ -277,11 +353,13 @@ impl Inner {
         if !ex.s.is_open() {
             return Ok(());
         }
-        let Some(a) = ex.s.activities.get(&sid).cloned() else { return Ok(()) };
-        if let Some(att) = attempt {
-            if a.attempt != att {
-                return Ok(());
-            }
+        let Some(a) = ex.s.activities.get(&sid).cloned() else {
+            return Ok(());
+        };
+        if let Some(att) = attempt
+            && a.attempt != att
+        {
+            return Ok(());
         }
         let attrs = a.attrs.clone().unwrap_or_default();
         let now = now_ms();
@@ -295,7 +373,14 @@ impl Inner {
                     let hb = dur_ms(&attrs.heartbeat_timeout);
                     let last = a.last_heartbeat_ms.max(a.started_ms);
                     if now < last + hb {
-                        self.add_timer(last + hb, TimerKind::ActHeartbeat { key: key.clone(), scheduled_id: sid, attempt: a.attempt });
+                        self.add_timer(
+                            last + hb,
+                            TimerKind::ActHeartbeat {
+                                key: key.clone(),
+                                scheduled_id: sid,
+                                attempt: a.attempt,
+                            },
+                        );
                         false
                     } else {
                         true
@@ -334,16 +419,36 @@ impl Inner {
             activity_type: attrs.activity_type.clone(),
             state: state as i32,
             heartbeat_details: a.heartbeat_details.clone(),
-            last_heartbeat_time: if a.last_heartbeat_ms > 0 { Some(ts_from_ms(a.last_heartbeat_ms)) } else { None },
-            last_started_time: if a.started_ms > 0 { Some(ts_from_ms(a.started_ms)) } else { None },
+            last_heartbeat_time: if a.last_heartbeat_ms > 0 {
+                Some(ts_from_ms(a.last_heartbeat_ms))
+            } else {
+                None
+            },
+            last_started_time: if a.started_ms > 0 {
+                Some(ts_from_ms(a.started_ms))
+            } else {
+                None
+            },
             attempt: a.attempt,
             maximum_attempts: attrs.retry_policy.as_ref().map(|r| r.maximum_attempts).unwrap_or(0),
             scheduled_time: Some(ts_from_ms(a.attempt_scheduled_ms)),
-            expiration_time: if a.expiration_ms > 0 { Some(ts_from_ms(a.expiration_ms)) } else { None },
+            expiration_time: if a.expiration_ms > 0 {
+                Some(ts_from_ms(a.expiration_ms))
+            } else {
+                None
+            },
             last_failure: a.last_failure.clone(),
             last_worker_identity: a.last_identity.clone(),
-            last_attempt_complete_time: if a.last_attempt_complete_ms > 0 { Some(ts_from_ms(a.last_attempt_complete_ms)) } else { None },
-            next_attempt_schedule_time: if a.state == ACT_BACKOFF { Some(ts_from_ms(a.next_attempt_ms)) } else { None },
+            last_attempt_complete_time: if a.last_attempt_complete_ms > 0 {
+                Some(ts_from_ms(a.last_attempt_complete_ms))
+            } else {
+                None
+            },
+            next_attempt_schedule_time: if a.state == ACT_BACKOFF {
+                Some(ts_from_ms(a.next_attempt_ms))
+            } else {
+                None
+            },
             ..Default::default()
         }
     }

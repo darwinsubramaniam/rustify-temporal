@@ -129,7 +129,11 @@ pub fn status_with_detail<M: Message>(code: tonic::Code, msg: &str, type_name: &
         type_url: format!("type.googleapis.com/{type_name}"),
         value: detail.encode_to_vec(),
     };
-    let st = RpcStatus { code: code as i32, message: msg.to_string(), details: vec![any] };
+    let st = RpcStatus {
+        code: code as i32,
+        message: msg.to_string(),
+        details: vec![any],
+    };
     Status::with_details(code, msg.to_string(), st.encode_to_vec().into())
 }
 
@@ -151,7 +155,9 @@ pub fn namespace_not_found(ns: &str) -> Status {
         tonic::Code::NotFound,
         &format!("Namespace {ns} is not found."),
         "temporal.api.errordetails.v1.NamespaceNotFoundFailure",
-        &errordetails::NamespaceNotFoundFailure { namespace: ns.to_string() },
+        &errordetails::NamespaceNotFoundFailure {
+            namespace: ns.to_string(),
+        },
     )
 }
 
@@ -165,7 +171,10 @@ pub fn wf_not_found(wid: &str, rid: &str) -> Status {
         tonic::Code::NotFound,
         &msg,
         "temporal.api.errordetails.v1.NotFoundFailure",
-        &errordetails::NotFoundFailure { current_cluster: "active".into(), active_cluster: "active".into() },
+        &errordetails::NotFoundFailure {
+            current_cluster: "active".into(),
+            active_cluster: "active".into(),
+        },
     )
 }
 
@@ -193,10 +202,12 @@ pub fn timeout_failure(kind: enums::TimeoutType, last_hb: Option<common::Payload
     failure::Failure {
         message: format!("{what} {name} timeout"),
         source: "Server".into(),
-        failure_info: Some(failure::failure::FailureInfo::TimeoutFailureInfo(failure::TimeoutFailureInfo {
-            timeout_type: kind as i32,
-            last_heartbeat_details: last_hb,
-        })),
+        failure_info: Some(failure::failure::FailureInfo::TimeoutFailureInfo(
+            failure::TimeoutFailureInfo {
+                timeout_type: kind as i32,
+                last_heartbeat_details: last_hb,
+            },
+        )),
         ..Default::default()
     }
 }
@@ -205,9 +216,9 @@ pub fn server_failure(msg: &str, non_retryable: bool) -> failure::Failure {
     failure::Failure {
         message: msg.to_string(),
         source: "Server".into(),
-        failure_info: Some(failure::failure::FailureInfo::ServerFailureInfo(failure::ServerFailureInfo {
-            non_retryable,
-        })),
+        failure_info: Some(failure::failure::FailureInfo::ServerFailureInfo(
+            failure::ServerFailureInfo { non_retryable },
+        )),
         ..Default::default()
     }
 }
