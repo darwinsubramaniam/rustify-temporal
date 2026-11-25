@@ -168,8 +168,9 @@ pub fn namespace_not_found(ns: &str) -> Status {
 }
 
 pub fn wf_not_found(wid: &str, rid: &str) -> Status {
+    // Go: the current-run lookup says "workflow not found for ID", a run lookup names both ids.
     let msg = if rid.is_empty() {
-        format!("workflow execution not found for workflow ID \"{wid}\"")
+        format!("workflow not found for ID: {wid}")
     } else {
         format!("workflow execution not found for workflow ID \"{wid}\" and run ID \"{rid}\"")
     };
@@ -178,8 +179,8 @@ pub fn wf_not_found(wid: &str, rid: &str) -> Status {
         &msg,
         "temporal.api.errordetails.v1.NotFoundFailure",
         &errordetails::NotFoundFailure {
-            current_cluster: "active".into(),
-            active_cluster: "active".into(),
+            current_cluster: String::new(),
+            active_cluster: String::new(),
         },
     )
 }
@@ -190,6 +191,16 @@ pub fn task_not_found() -> Status {
 
 pub fn activity_not_found() -> Status {
     not_found("invalid activityID or activity already timed out or invoking workflow is completed")
+}
+
+/// An operation of a multi-operation request that didn't run because another one failed.
+pub fn multi_op_aborted() -> Status {
+    status_with_detail(
+        tonic::Code::Aborted,
+        "Operation was aborted.",
+        "temporal.api.failure.v1.MultiOperationExecutionAborted",
+        &failure::MultiOperationExecutionAborted {},
+    )
 }
 
 pub fn wf_completed_error() -> Status {

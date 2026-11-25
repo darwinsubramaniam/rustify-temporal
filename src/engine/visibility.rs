@@ -3,11 +3,57 @@
 use super::*;
 use crate::store::ListFilter;
 
-pub struct HistoryPage {
-    pub events: Vec<history::HistoryEvent>,
-    pub closed: bool,
-    pub next: i64,
-    pub transient: Vec<history::HistoryEvent>,
+/// A history continuation token (opaque to clients).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct HistTok {
+    /// Run id.
+    pub r: String,
+    /// First event id of the snapshot being read.
+    pub f: i64,
+    /// Next event id when the snapshot was taken (reverse: the newest event left to read).
+    pub n: i64,
+    /// The run was open at the snapshot.
+    pub run: bool,
+    /// First event id of the next batch to read (0: the snapshot is read).
+    pub c: i64,
+}
+
+impl HistTok {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+    pub fn decode(b: &[u8]) -> R<HistTok> {
+        serde_json::from_slice(b).map_err(|_| invalid("Invalid NextPageToken."))
+    }
+}
+
+/// The history's batches as (first, last) event ids, oldest first. Events written before
+/// batches were recorded count as one batch each.
+fn batches(ex: &Execution) -> Vec<(i64, i64)> {
+    let last = ex.s.next_event_id - 1;
+    let recorded = ex.s.batch_starts.first().copied().unwrap_or(last + 1);
+    let mut starts: Vec<i64> = (1..recorded.min(last + 1)).collect();
+    starts.extend(ex.s.batch_starts.iter().copied().filter(|&s| s <= last));
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| (a, starts.get(i + 1).map(|b| b - 1).unwrap_or(last)))
+        .collect()
+}
+
+/// The events of `ranges` below `before`.
+fn events_in(ex: &Execution, ranges: &[(i64, i64)], before: i64) -> Vec<history::HistoryEvent> {
+    let mut out = Vec::new();
+    for &(a, b) in ranges {
+        for id in a..=b.min(before - 1) {
+            if let Some(e) = ex.events.get((id - 1) as usize).filter(|e| e.event_id == id) {
+                out.push(e.clone());
+            } else if let Some(e) = ex.events.iter().find(|e| e.event_id == id) {
+                out.push(e.clone());
+            }
+        }
+    }
+    out
 }
 
 pub fn exec_info(ex: &Execution) -> workflow_pb::WorkflowExecutionInfo {
@@ -132,36 +178,97 @@ pub fn parse_query(q: &str) -> R<ListFilter> {
 }
 
 impl Inner {
-    /// History of a run starting at `from` (an event id). Returns the events and whether the run is closed.
-    /// History of a run starting at `from` (an event id): the written events, whether the run
-    /// is closed, the next event id, and the events of a transient workflow task that aren't
-    /// written yet (the Go server shows those at the end of the history).
-    pub fn history_from(&mut self, key: &Key, from: i64, close_only: bool) -> R<HistoryPage> {
+    /// Where a history reader stands: the run, the snapshot of events being read
+    /// (`first`..`next`), whether the run was open then, and the batch to read next (0 = done
+    /// with the snapshot). The Go server's history continuation token.
+    pub fn history_start(&mut self, key: &Key) -> R<HistTok> {
         if !self.ensure_loaded(key)? {
             return Err(wf_not_found("", &key.1));
         }
         let ex = &self.execs[key];
-        let closed = !ex.s.is_open();
-        if close_only {
-            let ev = if closed {
-                ex.events.last().cloned().into_iter().collect()
-            } else {
-                vec![]
-            };
-            return Ok(HistoryPage {
-                events: ev,
-                closed,
-                next: ex.s.next_event_id,
-                transient: vec![],
-            });
-        }
-        let ev = ex.events.iter().filter(|e| e.event_id >= from).cloned().collect();
-        Ok(HistoryPage {
-            events: ev,
-            closed,
-            next: ex.s.next_event_id,
-            transient: super::events::transient_events(ex),
+        Ok(HistTok {
+            r: key.1.clone(),
+            f: 1,
+            n: ex.s.next_event_id,
+            run: ex.s.is_open(),
+            c: 0,
         })
+    }
+
+    /// The run's next event id and whether it is open.
+    pub fn run_progress(&mut self, key: &Key) -> R<(i64, bool)> {
+        if !self.ensure_loaded(key)? {
+            return Err(wf_not_found("", &key.1));
+        }
+        let ex = &self.execs[key];
+        Ok((ex.s.next_event_id, ex.s.is_open()))
+    }
+
+    /// The close event of a closed run.
+    pub fn close_event(&mut self, key: &Key) -> R<Option<history::HistoryEvent>> {
+        if !self.ensure_loaded(key)? {
+            return Err(wf_not_found("", &key.1));
+        }
+        let ex = &self.execs[key];
+        Ok(if ex.s.is_open() {
+            None
+        } else {
+            ex.events.last().cloned()
+        })
+    }
+
+    /// One page of history: up to `page` batches from where `tok` stands, then (once the
+    /// snapshot is read) events written since and the unwritten events of a transient or
+    /// speculative workflow task, as the Go server pages it.
+    pub fn history_read(&mut self, key: &Key, tok: &mut HistTok, page: usize) -> R<Vec<history::HistoryEvent>> {
+        if !self.ensure_loaded(key)? {
+            return Err(wf_not_found("", &key.1));
+        }
+        let ex = &self.execs[key];
+        if tok.f >= tok.n {
+            return Ok(Vec::new());
+        }
+        let from = if tok.c > 0 { tok.c } else { tok.f };
+        let all = batches(ex);
+        let picked: Vec<(i64, i64)> = all
+            .iter()
+            .copied()
+            .filter(|(a, _)| *a >= from && *a < tok.n)
+            .take(page)
+            .collect();
+        let mut events = events_in(ex, &picked, tok.n);
+        if picked.len() == page {
+            tok.c = picked.last().map(|(_, b)| b + 1).unwrap_or(0);
+            return Ok(events);
+        }
+        tok.c = 0;
+        // Events written after the snapshot (one more page of them).
+        if ex.s.next_event_id > tok.n {
+            let gap: Vec<(i64, i64)> = all.iter().copied().filter(|(a, _)| *a >= tok.n).take(page).collect();
+            events.extend(events_in(ex, &gap, ex.s.next_event_id));
+            tok.n = ex.s.next_event_id;
+            tok.run = ex.s.is_open();
+        }
+        events.extend(super::events::transient_events(ex));
+        Ok(events)
+    }
+
+    /// One page of history newest first: up to `page` batches ending at `tok.n` (0 = the end).
+    pub fn history_read_reverse(&mut self, key: &Key, tok: &mut HistTok, page: usize) -> R<Vec<history::HistoryEvent>> {
+        if !self.ensure_loaded(key)? {
+            return Err(wf_not_found("", &key.1));
+        }
+        let ex = &self.execs[key];
+        let max = if tok.n == 0 { ex.s.next_event_id - 1 } else { tok.n };
+        let mut picked: Vec<(i64, i64)> = batches(ex).into_iter().filter(|(a, _)| *a <= max).collect();
+        let keep = picked.len().saturating_sub(page);
+        let picked = picked.split_off(keep);
+        let mut events = events_in(ex, &picked, max + 1);
+        events.reverse();
+        if let Some(last) = events.last() {
+            tok.n = last.event_id - 1;
+        }
+        Ok(events)
     }
 
     pub fn notify_of_run(&mut self, key: &Key) -> R<Arc<Notify>> {
@@ -193,7 +300,18 @@ impl Inner {
                 default_workflow_task_timeout: s.wft_timeout,
                 user_metadata: ex.events.first().and_then(|e| e.user_metadata.clone()),
             }),
-            workflow_execution_info: Some(exec_info(ex)),
+            workflow_execution_info: Some({
+                let mut info = exec_info(ex);
+                info.priority = s.priority.clone().or_else(|| {
+                    ex.events.first().and_then(|e| match &e.attributes {
+                        Some(history::history_event::Attributes::WorkflowExecutionStartedEventAttributes(a)) => {
+                            a.priority.clone()
+                        }
+                        _ => None,
+                    })
+                });
+                info
+            }),
             pending_activities: acts.into_iter().map(Inner::pending_activity_info).collect(),
             pending_children: kids
                 .into_iter()

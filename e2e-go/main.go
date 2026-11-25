@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
@@ -207,6 +208,29 @@ func main() {
 		err = run.Get(ctx, &final)
 	}
 	all = check("update", err, got == 5 && rejected && final == 5, []any{got, rejected, final}) && all
+
+	// Update-with-start: starts the workflow and runs the update on its first task.
+	uwsID := id("go-uws")
+	startOp := c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
+		ID: uwsID, TaskQueue: tq, WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	}, UpdateWorkflow)
+	var uwsGot, uwsFinal int
+	uh, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
+		StartWorkflowOperation: startOp,
+		UpdateOptions: client.UpdateWorkflowOptions{
+			WorkflowID: uwsID, UpdateName: "add", Args: []any{7}, WaitForStage: client.WorkflowUpdateStageCompleted,
+		},
+	})
+	if err == nil {
+		err = uh.Get(ctx, &uwsGot)
+	}
+	if err == nil {
+		err = c.SignalWorkflow(ctx, uwsID, "", "done", nil)
+	}
+	if err == nil {
+		err = c.GetWorkflow(ctx, uwsID, "").Get(ctx, &uwsFinal)
+	}
+	all = check("update-with-start", err, uwsGot == 7 && uwsFinal == 7, []int{uwsGot, uwsFinal}) && all
 
 	if !all {
 		os.Exit(1)

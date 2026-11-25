@@ -185,6 +185,25 @@ impl Store {
         Ok(())
     }
 
+    /// Remove a run: its state, events, and the current-run record if it points at it.
+    pub fn delete_execution(&mut self, ns: &str, workflow_id: &str, run_id: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM executions WHERE namespace = ?1 AND run_id = ?2",
+            params![ns, run_id],
+        )?;
+        tx.execute(
+            "DELETE FROM events WHERE namespace = ?1 AND run_id = ?2",
+            params![ns, run_id],
+        )?;
+        tx.execute(
+            "DELETE FROM current_executions WHERE namespace = ?1 AND workflow_id = ?2 AND run_id = ?3",
+            params![ns, workflow_id, run_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn where_clause(ns: &str, f: &ListFilter) -> (String, Vec<rusqlite::types::Value>) {
         let mut sql = String::from("namespace = ?");
         let mut args: Vec<rusqlite::types::Value> = vec![ns.to_string().into()];

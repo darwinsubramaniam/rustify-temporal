@@ -784,17 +784,19 @@ impl Inner {
     /// task keeps running until it times out; otherwise the task fails (and for oversized
     /// payloads the workflow is terminated). Returns the error for the worker (Go server rules).
     fn reject_wft(&mut self, ex: &mut Execution, w: &crate::state::WftInfo, reject: Reject, identity: &str) -> Status {
+        // Go's workflowTaskFailedCause.Message(): the cause's short name, then the reason.
+        let cause = cause_name(reject.cause);
         let msg = if reject.msg.is_empty() {
-            reject.cause.as_str_name().to_string()
+            cause
         } else {
-            format!("{}: {}", reject.cause.as_str_name(), reject.msg)
+            format!("{cause}: {}", reject.msg)
         };
         // Updates the failed task carried can't be answered by it (Go server's abort reasons).
         update::abort_updates(ex, Abort::TaskFailed);
         if w.attempt > 1 && reject.cause != enums::WorkflowTaskFailedCause::UnhandledCommand {
             return invalid(msg);
         }
-        let failure = (!reject.msg.is_empty()).then(|| server_failure(&reject.msg, true));
+        let failure = Some(server_failure(&msg, false));
         let next = self.record_wft_failure(ex, reject.cause, failure, identity);
         if reject.terminate {
             ex.s.wft = None;
@@ -970,6 +972,21 @@ impl Inner {
         self.put(ex);
         Ok(())
     }
+}
+
+/// A workflow task failure cause as the Go API prints it ("BadBinary", "UnhandledCommand").
+fn cause_name(c: enums::WorkflowTaskFailedCause) -> String {
+    c.as_str_name()
+        .trim_start_matches("WORKFLOW_TASK_FAILED_CAUSE_")
+        .split('_')
+        .map(|w| {
+            let mut cs = w.chars();
+            match cs.next() {
+                Some(f) => f.to_string() + &cs.as_str().to_lowercase(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 /// Why a completion is refused.

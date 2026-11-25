@@ -68,6 +68,9 @@ pub struct UpdateInfo {
     /// 0 until the update completes.
     #[prost(int64, tag = "2")]
     pub completed_event_id: i64,
+    /// An update re-admitted by a reset (WorkflowExecutionUpdateAdmitted), not yet accepted.
+    #[prost(int64, tag = "3")]
+    pub admitted_event_id: i64,
 }
 
 pub const ACT_SCHEDULED: i32 = 0;
@@ -233,6 +236,13 @@ pub struct ExecState {
     /// Accepted (and completed) workflow updates by update id.
     #[prost(map = "string, message", tag = "42")]
     pub updates: HashMap<String, UpdateInfo>,
+    /// First event id of each history batch (events written together), for paging history
+    /// the way the Go server does.
+    #[prost(int64, repeated, tag = "43")]
+    pub batch_starts: Vec<i64>,
+    /// The run's priority (from the start request, changed by UpdateWorkflowExecutionOptions).
+    #[prost(message, optional, tag = "44")]
+    pub priority: Option<common::Priority>,
 }
 
 impl ExecState {

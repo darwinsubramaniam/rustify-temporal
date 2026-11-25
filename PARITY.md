@@ -13,13 +13,14 @@ response shape, including the ones that answer *unimplemented*.
 
 | API | Operations | ✅ Yes | 🟡 Partial | ❌ No |
 |---|---|---|---|---|
-| WorkflowService (what SDKs and the CLI use) | 123 | 19 | 17 | 87 |
+| WorkflowService (what SDKs and the CLI use) | 123 | 23 | 20 | 80 |
 | OperatorService (search attributes, clusters, Nexus endpoints) | 15 | 0 | 0 | 15 |
 | AdminService (internal: tdbg, replication, DLQ tools) | 50 | 0 | 0 | 50 |
 
 Behaviour is checked step by step against the Go server with `scripts/namespace-parity.sh`:
-namespaces (38 steps), workflow tasks (`e2e/wft_parity.py`, 67 steps) and workflow updates
-(`e2e/update_parity.py`, 101 steps), all identical. Deprecated
+namespaces (38 steps), workflow tasks (`e2e/wft_parity.py`, 67 steps), workflow updates
+(`e2e/update_parity.py`, 101 steps) and running workflows (`e2e/running_parity.py`, 137 steps:
+history paging, delete, update-with-start, options, pause, reset), all identical. Deprecated
 namespaces refuse new workflows, deleted ones refuse everything but describe and list.
 
 Everything a worker needs to run workflows (start, workflow and activity tasks, timers, signals,
@@ -206,24 +207,24 @@ queries, updates, children, continue-as-new, retries, cancel, terminate, history
 | `GetClusterInfo` | 🟡 Partial | Fixed single-cluster answer. |
 | `GetSystemInfo` | 🟡 Partial | Reports the capabilities this server has (no schedules, Nexus, eager start, versioning). |
 
-### Running workflows (start, signal, cancel, history...) (7/14)
+### Running workflows (start, signal, cancel, history...) (14/14)
 
 | Operation | rustify | Notes |
 |---|---|---|
+| `DeleteWorkflowExecution` | ✅ Yes | Running runs are terminated first. Closed runs are removed right away (the Go server takes about 30 s). |
 | `DescribeWorkflowExecution` | 🟡 Partial | No callbacks, pending Nexus operations or versioning info. |
-| `GetWorkflowExecutionHistory` | 🟡 Partial | Whole history in one page (no page size), no raw history blobs, no archival. |
+| `ExecuteMultiOperation` | ✅ Yes | Update-with-start, matching the Go server (137-step check): start or reuse, answers from history, per-operation errors. |
+| `GetWorkflowExecutionHistory` | ✅ Yes | Paged by history batches like the Go server (137-step check), long-poll and close-event filter. No raw history blobs or archival (both off on the Go server by default). |
+| `GetWorkflowExecutionHistoryReverse` | ✅ Yes | Paged by batches from the end, like the Go server. |
+| `PauseWorkflowExecution` | 🟡 Partial | Answers like a Go server with workflow pause turned off (its default). |
 | `RequestCancelWorkflowExecution` | ✅ Yes |  |
+| `ResetWorkflowExecution` | 🟡 Partial | Matches the Go server (137-step check): reset points, failed task, re-applied signals, updates, options and child results, request-id dedupe, exclude types, post-reset options. Children still running report to the old run. |
 | `SignalWithStartWorkflowExecution` | 🟡 Partial | Same limits as StartWorkflowExecution. |
 | `SignalWorkflowExecution` | ✅ Yes |  |
-| `StartWorkflowExecution` | 🟡 Partial | No cron schedules, eager workflow start, completion callbacks, versioning override or links. |
+| `StartWorkflowExecution` | 🟡 Partial | No cron schedules, eager workflow start, completion callbacks, versioning override or request links. |
 | `TerminateWorkflowExecution` | ✅ Yes |  |
-| `DeleteWorkflowExecution` | ❌ No |  |
-| `ExecuteMultiOperation` | ❌ No |  |
-| `GetWorkflowExecutionHistoryReverse` | ❌ No |  |
-| `PauseWorkflowExecution` | ❌ No |  |
-| `ResetWorkflowExecution` | ❌ No |  |
-| `UnpauseWorkflowExecution` | ❌ No |  |
-| `UpdateWorkflowExecutionOptions` | ❌ No |  |
+| `UnpauseWorkflowExecution` | 🟡 Partial | Answers like a Go server with workflow pause turned off (its default): no workflow is ever paused. |
+| `UpdateWorkflowExecutionOptions` | 🟡 Partial | Priority, with the Go server's mask merging and checks. Versioning overrides are refused (worker versioning is missing); time skipping is off, as on the Go server by default. |
 
 ## OperatorService
 
@@ -270,9 +271,11 @@ Used by `tdbg`, `temporal operator` admin commands and replication. Served with 
 | Search attribute upsert and memo update | ✅ | 🟡 Partial | Stored and shown; not searchable in list filters. |
 | Start delay | ✅ | ✅ Yes |  |
 | Cron schedules | ✅ | ❌ No | Rejected with a clear error. |
-| Workflow updates | ✅ | ✅ Yes | Speculative tasks, rejections leave no history, limits (10 in flight, 2000 total), continue-as-new hint. Update-with-start needs ExecuteMultiOperation (missing). |
+| Workflow updates | ✅ | ✅ Yes | Speculative tasks, rejections leave no history, limits (10 in flight, 2000 total), continue-as-new hint, update-with-start. |
 | Nexus operations | ✅ | ❌ No |  |
-| Reset, pause/unpause, delete workflow | ✅ | ❌ No |  |
+| Reset workflow | ✅ | ✅ Yes | Rebuilt from history; signals, updates, options and child results after the reset point applied again. |
+| Delete workflow | ✅ | ✅ Yes | Closed runs are removed right away (the Go server takes about 30 s). |
+| Pause/unpause workflow | Off by default | Off | Answers like a Go server with pause turned off. |
 | Sticky queues: schedule-to-start timeout, reset | ✅ | ✅ Yes | The timeout is recorded and the task moves to the normal queue. |
 | Refused completions (bad commands, unseen signals, bad builds) | ✅ | ✅ Yes | Same causes and errors; a refused retry leaves the task running. |
 | Payload and pending-work limits | ✅ | ✅ Yes | 2 MB payloads (terminates), 2000 pending activities or children. |
@@ -305,6 +308,6 @@ Used by `tdbg`, `temporal operator` admin commands and replication. Served with 
 | Temporal Web UI | ✅ | ❌ No | The UI needs many missing operations. |
 | Temporal CLI | ✅ | 🟡 Partial | Workflow start/signal/query/describe/list/terminate/cancel should work; schedules, batch, operator and admin commands don't. Not yet tested. |
 | Payload and history size limits | ✅ Enforced, warns and terminates | ✅ Yes | 2 MB payloads; 50 MB or 51,200-event histories terminate (Go defaults). |
-| Official SDK compatibility | All SDKs | 🟡 Partial | Python SDK 1.36.1 (24 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested. |
+| Official SDK compatibility | All SDKs | 🟡 Partial | Python SDK 1.36.1 (28 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested. |
 
 See `bench/RESULTS.md` for speed and resource use on the operations both servers have.
