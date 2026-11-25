@@ -230,6 +230,7 @@ impl Inner {
             priority: p.priority.clone(),
             ..Default::default()
         };
+        ex.s.priority = attrs.priority.clone();
         push(&mut ex, A::WorkflowExecutionStartedEventAttributes(attrs));
         if let Some(um) = p.user_metadata {
             ex.events[0].user_metadata = Some(um);
@@ -494,6 +495,80 @@ impl Inner {
         Ok(())
     }
 
+    /// UpdateWorkflowExecutionOptions (Go's MergeAndApply): merge the masked fields into the
+    /// run's options and, if anything changed, record WorkflowExecutionOptionsUpdated (no new
+    /// workflow task). Returns the merged options.
+    pub fn update_options(
+        &mut self,
+        key: &Key,
+        req: &workflow_pb::WorkflowExecutionOptions,
+        fields: &[String],
+        identity: &str,
+    ) -> R<workflow_pb::WorkflowExecutionOptions> {
+        let mut ex = self.take(key)?;
+        if !ex.s.is_open() {
+            self.put(ex);
+            return Err(wf_completed_error());
+        }
+        let current = workflow_pb::WorkflowExecutionOptions {
+            versioning_override: None,
+            priority: ex.s.priority.clone(),
+            time_skipping_config: None,
+        };
+        let merged = match merge_options(&current, req, fields) {
+            Ok(m) => m,
+            Err(e) => {
+                self.put(ex);
+                return Err(invalid(format!("error applying update_options: {}", e.message())));
+            }
+        };
+        if merged.versioning_override.is_some() {
+            self.put(ex);
+            return Err(invalid("Worker versioning is not supported by this server yet."));
+        }
+        if merged != current {
+            // Like the Go server, an options event without a priority leaves the priority as is.
+            if merged.priority.is_some() {
+                ex.s.priority = merged.priority.clone();
+            }
+            push_external(
+                &mut ex,
+                A::WorkflowExecutionOptionsUpdatedEventAttributes(
+                    history::WorkflowExecutionOptionsUpdatedEventAttributes {
+                        versioning_override: None,
+                        unset_versioning_override: true,
+                        identity: identity.to_string(),
+                        priority: merged.priority.clone(),
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        self.put(ex);
+        Ok(merged)
+    }
+
+    /// DeleteWorkflowExecution: a running run is terminated first (Go server), then the run
+    /// and its history are removed.
+    pub fn delete_execution(&mut self, key: &Key) -> R<()> {
+        if !self.ensure_loaded(key)? {
+            return Err(wf_not_found("", &key.1));
+        }
+        if self.execs[key].s.is_open() {
+            self.terminate_key(key, "Delete workflow execution", None, HISTORY_SERVICE_IDENTITY)?;
+        }
+        let Some(ex) = self.execs.remove(key) else {
+            return Ok(());
+        };
+        self.dirty.remove(key);
+        let wid = ex.s.workflow_id.clone();
+        if self.current.get(&(key.0.clone(), wid.clone())) == Some(&key.1) {
+            self.current.remove(&(key.0.clone(), wid.clone()));
+        }
+        self.queries.retain(|_, q| &q.key != key);
+        self.store.delete_execution(&key.0, &wid, &key.1).map_err(internal)
+    }
+
     /// Mark a run closed after its close event was written.
     pub fn finish_close(&mut self, ex: &mut Execution, status: enums::WorkflowExecutionStatus, notify_parent: bool) {
         ex.s.status = status as i32;
@@ -716,6 +791,8 @@ impl Inner {
                 tracing::error!("too many chained actions; stopping");
                 break;
             }
+            // Each action is its own write in the Go server.
+            super::events::new_write();
             let r = match a {
                 Action::StartChild {
                     parent,
@@ -1111,6 +1188,53 @@ impl Inner {
         self.put(ex);
         Ok(())
     }
+}
+
+/// Go's mergeWorkflowExecutionOptions over the fields named by the update mask (camelCase).
+pub fn merge_options(
+    into: &workflow_pb::WorkflowExecutionOptions,
+    from: &workflow_pb::WorkflowExecutionOptions,
+    fields: &[String],
+) -> R<workflow_pb::WorkflowExecutionOptions> {
+    let mut m = into.clone();
+    let has = |f: &str| fields.iter().any(|x| x == f);
+    if has("versioningOverride") {
+        m.versioning_override = from.versioning_override.clone();
+    }
+    let (dep, beh) = (has("versioningOverride.deployment"), has("versioningOverride.behavior"));
+    if dep != beh {
+        return Err(invalid("versioning_override fields must be updated together"));
+    }
+    if dep {
+        m.versioning_override = from.versioning_override.clone();
+    }
+    if fields.iter().any(|k| {
+        k.starts_with("versioningOverride.")
+            && k != "versioningOverride.deployment"
+            && k != "versioningOverride.behavior"
+    }) {
+        return Err(invalid("versioning_override doesn't support partial updates"));
+    }
+    let fp = from.priority.clone().unwrap_or_default();
+    if has("priority") {
+        m.priority = from.priority.clone();
+    }
+    if has("priority.priorityKey") {
+        m.priority.get_or_insert_with(Default::default).priority_key = fp.priority_key;
+    }
+    if has("priority.fairnessKey") {
+        m.priority.get_or_insert_with(Default::default).fairness_key = fp.fairness_key.clone();
+    }
+    if has("priority.fairnessWeight") {
+        m.priority.get_or_insert_with(Default::default).fairness_weight = fp.fairness_weight;
+    }
+    if has("timeSkippingConfig") {
+        m.time_skipping_config = from.time_skipping_config.clone();
+    }
+    if fields.iter().any(|k| k.starts_with("timeSkippingConfig.")) {
+        return Err(invalid("time_skipping_config doesn't support partial update"));
+    }
+    Ok(m)
 }
 
 #[cfg(test)]

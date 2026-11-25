@@ -283,6 +283,86 @@ async def t_update(c: Client):
     assert kinds.count(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_COMPLETED) == 4, kinds
 
 
+async def t_update_with_start(c: Client):
+    from temporalio.client import WithStartWorkflowOperation
+    from temporalio.common import WorkflowIDConflictPolicy
+
+    workflow_id = wid("uws")
+
+    def op() -> WithStartWorkflowOperation:
+        return WithStartWorkflowOperation(
+            w.UpdateWorkflow.run,
+            id=workflow_id,
+            task_queue=TQ,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        )
+
+    first = op()
+    assert await c.execute_update_with_start_workflow(w.UpdateWorkflow.add, "x", start_workflow_operation=first) == 1
+    h = await first.workflow_handle()
+    # The workflow is running now: the same call just updates it.
+    second = op()
+    assert await c.execute_update_with_start_workflow(w.UpdateWorkflow.add, "y", start_workflow_operation=second) == 2
+    assert (await second.workflow_handle()).result_run_id == h.result_run_id
+    await h.signal(w.UpdateWorkflow.finish)
+    assert await h.result() == ["x", "y"]
+
+
+async def t_reset(c: Client):
+    from temporalio.api.common.v1 import WorkflowExecution
+    from temporalio.api.workflowservice.v1 import ResetWorkflowExecutionRequest
+
+    h = await c.start_workflow(w.SignalQueryWorkflow.run, id=wid("reset"), task_queue=TQ)
+    await h.signal(w.SignalQueryWorkflow.add, "a")
+    await h.signal(w.SignalQueryWorkflow.add, "b")
+    for _ in range(50):
+        if await h.query(w.SignalQueryWorkflow.count) == 2:
+            break
+        await asyncio.sleep(0.1)
+    events = [e async for e in h.fetch_history_events()]
+    first_task_done = next(e.event_id for e in events if e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED)
+    resp = await c.workflow_service.reset_workflow_execution(
+        ResetWorkflowExecutionRequest(
+            namespace="default",
+            workflow_execution=WorkflowExecution(workflow_id=h.id, run_id=h.result_run_id),
+            reason="e2e reset",
+            workflow_task_finish_event_id=first_task_done,
+            request_id=str(uuid.uuid4()),
+        )
+    )
+    assert resp.run_id != h.result_run_id
+    old = await c.get_workflow_handle(h.id, run_id=h.result_run_id).describe()
+    assert old.status == WorkflowExecutionStatus.TERMINATED, old.status
+    # The signals after the reset point are applied again on the new run.
+    new = c.get_workflow_handle(h.id, run_id=resp.run_id)
+    await new.signal(w.SignalQueryWorkflow.finish)
+    assert await new.result() == ["a", "b"]
+
+
+async def t_delete(c: Client):
+    h = await c.start_workflow(w.HelloWorkflow.run, "delete", id=wid("delete"), task_queue=TQ)
+    await h.result()
+    from temporalio.api.common.v1 import WorkflowExecution
+    from temporalio.api.workflowservice.v1 import DeleteWorkflowExecutionRequest
+
+    await c.workflow_service.delete_workflow_execution(
+        DeleteWorkflowExecutionRequest(namespace="default", workflow_execution=WorkflowExecution(workflow_id=h.id))
+    )
+    try:
+        await h.describe()
+        raise AssertionError("expected not found")
+    except RPCError as e:
+        assert "not found" in e.message.lower(), e.message
+
+
+async def t_history_pages(c: Client):
+    h = await c.start_workflow(w.ManyActivitiesWorkflow.run, 5, id=wid("pages"), task_queue=TQ)
+    await h.result()
+    full = [e.event_id async for e in h.fetch_history_events()]
+    paged = [e.event_id async for e in h.fetch_history_events(page_size=2)]
+    assert paged == full == list(range(1, len(full) + 1)), (paged, full)
+
+
 TESTS = [
     t_hello,
     t_activity_retry,
@@ -307,6 +387,10 @@ TESTS = [
     t_unknown_workflow,
     t_execution_timeout,
     t_update,
+    t_update_with_start,
+    t_reset,
+    t_delete,
+    t_history_pages,
 ]
 
 

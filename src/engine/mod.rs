@@ -3,12 +3,14 @@
 //! server-side timers (user timers, task timeouts, retries, run timeouts).
 
 pub mod activity;
-mod events;
+pub mod events;
 pub mod namespace;
 mod query;
+mod replay;
+mod reset;
 mod timers;
 pub mod update;
-mod visibility;
+pub mod visibility;
 mod wft;
 mod workflow;
 
@@ -51,6 +53,10 @@ pub struct Execution {
     pub notify: Arc<Notify>,
     /// In-flight workflow updates (memory only; rebuilt from `s.updates` when loaded).
     pub updates: update::Registry,
+    /// The write the run's last event belongs to (see [`events::new_write`]).
+    pub batch_gen: u64,
+    /// The next event starts a new batch (after a workflow task started event).
+    pub new_batch: bool,
 }
 
 impl Execution {
@@ -63,6 +69,8 @@ impl Execution {
             saved_events: saved,
             notify: Arc::new(Notify::new()),
             updates,
+            batch_gen: 0,
+            new_batch: false,
         }
     }
     pub fn key(&self) -> Key {
@@ -332,7 +340,7 @@ impl Inner {
     }
 
     /// Re-create the in-memory queue entries and timers of an open run after a restart.
-    fn rearm(&mut self, ex: &mut Execution) {
+    pub(crate) fn rearm(&mut self, ex: &mut Execution) {
         let key = ex.key();
         let now = now_ms();
         // Sticky workers don't survive a restart.
@@ -607,6 +615,7 @@ impl Inner {
             .collect();
         let res = self.store.save(&items);
         drop(items);
+        events::new_write();
         match res {
             Ok(()) => {
                 for (k, _, _) in snapshots {

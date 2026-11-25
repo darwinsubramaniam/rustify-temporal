@@ -142,6 +142,16 @@ impl Registry {
             if info.completed_event_id > 0 {
                 continue;
             }
+            if info.accepted_event_id == 0 {
+                // Admitted from a history event: the request is in that event, not sent again.
+                if info.admitted_event_id > 0 && s.is_open() {
+                    let seq = r.next_seq();
+                    let mut u = Update::new(id, UState::Admitted, None, seq);
+                    u.publish();
+                    r.map.insert(id.clone(), u);
+                }
+                continue;
+            }
             let mut u = Update::new(id, UState::Accepted, None, 0);
             u.accepted_event_id = info.accepted_event_id;
             u.status.accepted_event_id = info.accepted_event_id;
@@ -306,7 +316,17 @@ fn abort_one(u: &mut Update, reason: Abort) {
 pub fn abort_updates(ex: &mut Execution, reason: Abort) {
     let ids: Vec<String> = ex.updates.map.keys().cloned().collect();
     for id in ids {
+        // An update admitted by a history event is reloaded as admitted when the Go server
+        // rebuilds the run after a failed task; it stays in flight.
+        let durable =
+            ex.s.updates
+                .get(&id)
+                .is_some_and(|i| i.admitted_event_id > 0 && i.accepted_event_id == 0);
         let u = ex.updates.map.get_mut(&id).expect("present");
+        if reason == Abort::TaskFailed && durable && u.state == UState::Sent {
+            u.state = UState::Admitted;
+            continue;
+        }
         let before = u.state;
         abort_one(u, reason);
         // Updates the workflow never saw are dropped when its task failed, so a retried call
@@ -646,7 +666,7 @@ pub fn apply_message(ex: &mut Execution, m: &protocol_pb::Message) {
                 id.clone(),
                 UpdateInfo {
                     accepted_event_id: eid,
-                    completed_event_id: 0,
+                    ..Default::default()
                 },
             );
             let u = ex.updates.map.get_mut(&id).expect("present");
@@ -816,6 +836,108 @@ impl Inner {
             workflow_id: ex.s.workflow_id.clone(),
             run_id: ex.s.run_id.clone(),
         })
+    }
+}
+
+/// Track an update re-admitted by a reset (its request is in the admitted event).
+pub fn readmit(ex: &mut Execution, id: &str) {
+    if ex.updates.map.contains_key(id) {
+        return;
+    }
+    let seq = ex.updates.next_seq();
+    ex.updates
+        .map
+        .insert(id.to_string(), Update::new(id, UState::Admitted, None, seq));
+}
+
+/// The run an update-with-start landed on.
+pub struct UwsRun {
+    pub run_id: String,
+    pub first_run_id: String,
+    pub started: bool,
+    pub status: i32,
+    /// The start response links to the started event (not when answered from history).
+    pub link: bool,
+}
+
+impl Inner {
+    /// ExecuteMultiOperation's update-with-start, under the lock: update the running workflow
+    /// when it is the one asked for (same start request, update already known, or the
+    /// use-existing conflict policy), otherwise start a new run with the update admitted.
+    /// Errors are per operation: [start, update].
+    pub fn update_with_start(
+        &mut self,
+        start: wsv1::StartWorkflowExecutionRequest,
+        req: update_pb::Request,
+    ) -> Result<(UwsRun, UpdHandle), [Option<Status>; 2]> {
+        use enums::WorkflowIdConflictPolicy as CP;
+        let aborted = multi_op_aborted;
+        let id = req.meta.as_ref().map(|m| m.update_id.clone()).unwrap_or_default();
+        let ns = start.namespace.clone();
+        let current = self.current.get(&(ns.clone(), start.workflow_id.clone())).cloned();
+        if let Some(rid) = &current {
+            let key = (ns.clone(), rid.clone());
+            if self.ensure_loaded(&key).unwrap_or(false) {
+                let ex = &self.execs[&key];
+                let run = UwsRun {
+                    run_id: rid.clone(),
+                    first_run_id: ex.s.first_run_id.clone(),
+                    started: false,
+                    status: ex.s.status,
+                    link: true,
+                };
+                if let Some(rx) = completed_from_history(ex, &id) {
+                    let run = UwsRun { link: false, ..run };
+                    let h = UpdHandle {
+                        rx,
+                        workflow_id: ex.s.workflow_id.clone(),
+                        run_id: rid.clone(),
+                    };
+                    return Ok((run, h));
+                }
+                let reuse = ex.s.is_open()
+                    && (start.request_id == ex.s.start_request_id
+                        || ex.updates.map.contains_key(&id)
+                        || start.workflow_id_conflict_policy == CP::UseExisting as i32);
+                if reuse {
+                    return match self.update_workflow(&key, "", req) {
+                        Ok(h) => Ok((run, h)),
+                        Err(e) => Err([Some(aborted()), Some(e)]),
+                    };
+                }
+            }
+        }
+        let (rid, _) = self.start_workflow(start).map_err(|e| [Some(e), Some(aborted())])?;
+        if current.as_ref() == Some(&rid) {
+            return Err([
+                Some(Status::unavailable("Workflow was not started: StartDeduped")),
+                Some(aborted()),
+            ]);
+        }
+        let key = (ns, rid.clone());
+        let first = self.first_run_id(&key);
+        let h = self
+            .update_workflow(&key, "", req)
+            .map_err(|e| [Some(aborted()), Some(e)])?;
+        Ok((
+            UwsRun {
+                run_id: rid,
+                first_run_id: first,
+                started: true,
+                status: enums::WorkflowExecutionStatus::Running as i32,
+                link: true,
+            },
+            h,
+        ))
+    }
+
+    /// The first run id of a run's chain ("" if the run is unknown).
+    pub fn first_run_id(&mut self, key: &Key) -> String {
+        if self.ensure_loaded(key).unwrap_or(false) {
+            self.execs[key].s.first_run_id.clone()
+        } else {
+            String::new()
+        }
     }
 }
 

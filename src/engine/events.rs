@@ -57,6 +57,8 @@ pub fn event_type(a: &A) -> enums::EventType {
         A::WorkflowPropertiesModifiedEventAttributes(_) => E::WorkflowPropertiesModified,
         A::WorkflowExecutionUpdateAcceptedEventAttributes(_) => E::WorkflowExecutionUpdateAccepted,
         A::WorkflowExecutionUpdateCompletedEventAttributes(_) => E::WorkflowExecutionUpdateCompleted,
+        A::WorkflowExecutionOptionsUpdatedEventAttributes(_) => E::WorkflowExecutionOptionsUpdated,
+        A::WorkflowExecutionUpdateAdmittedEventAttributes(_) => E::WorkflowExecutionUpdateAdmitted,
         _ => E::Unspecified,
     }
 }
@@ -72,10 +74,29 @@ pub fn make_event(id: i64, a: A) -> history::HistoryEvent {
     }
 }
 
+static WRITE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A new write begins (the Go server's transaction): the next event any run gets starts a new
+/// history batch.
+pub fn new_write() {
+    WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Append an event to the history now.
 pub fn push(ex: &mut Execution, a: A) -> i64 {
     let id = ex.s.next_event_id;
     ex.s.next_event_id += 1;
+    // Batches as the Go server writes them: one per write, and a workflow task started event
+    // always ends its batch.
+    let gen_now = WRITE_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    if ex.batch_gen != gen_now || ex.new_batch || ex.s.batch_starts.is_empty() {
+        ex.s.batch_starts.push(id);
+        ex.batch_gen = gen_now;
+        ex.new_batch = false;
+    }
+    if matches!(a, A::WorkflowTaskStartedEventAttributes(_)) {
+        ex.new_batch = true;
+    }
     let ev = make_event(id, a);
     ex.s.history_size += ev.encoded_len() as i64;
     ex.s.transitions += 1;

@@ -4,7 +4,7 @@ A Temporal-compatible workflow server written in Rust. The official Temporal SDK
 exactly as they connect to the Temporal server: same gRPC API (`temporal.api.workflowservice.v1`),
 same port (7233), no SDK changes. Everything is stored in one SQLite file.
 
-Tested end to end with the official **Python SDK** (`temporalio` 1.36.1, 24 scenarios) and the
+Tested end to end with the official **Python SDK** (`temporalio` 1.36.1, 28 scenarios) and the
 official **Go SDK** (`go.temporal.io/sdk` 1.51.0).
 
 ## Run it
@@ -29,7 +29,7 @@ client = await Client.connect("127.0.0.1:7233", namespace="default")
 | Area | Supported |
 |---|---|
 | Namespaces | register, describe, list (paging, include-deleted), update (state, retention, bad binaries, replication checks), deprecate; namespace states enforced like the Go server (38-step side-by-side check); `default` created automatically |
-| Workflows | start (id reuse and conflict policies, start delay, request-id dedupe), signal, signal-with-start, query, cancel, terminate, describe, history (long-poll, close-event filter), list/count |
+| Workflows | start (id reuse and conflict policies, start delay, request-id dedupe), signal, signal-with-start, query, cancel, terminate, describe, list/count; same behaviour as the Go server (137 side-by-side steps) for history paging (forward and reverse, by batch, long-poll, close-event filter), delete, update-with-start (`ExecuteMultiOperation`), workflow options (priority), pause/unpause (off, as by default on the Go server) and reset (re-applied signals, updates, options and child results, exclude types, request-id dedupe) |
 | Workflow tasks | same behaviour as the Go server, checked in 67 side-by-side steps: transient retries with growing timeouts, sticky queues and their timeouts, refused completions (bad commands, unseen signals, bad builds), eager activities, payload/pending limits, continue-as-new suggestions, `return_new_workflow_task` |
 | Commands | activities, timers, complete/fail/cancel, continue-as-new, markers (local activities, patches, side effects), search-attribute upsert, memo update, child workflows, signal external, cancel external |
 | Activities | dispatch, heartbeats (with details and cancel requests), server-side retries with backoff, `next_retry_delay`, non-retryable types, schedule-to-start / start-to-close / schedule-to-close / heartbeat timeouts, complete/fail/cancel by token or by id |
@@ -50,9 +50,9 @@ The full operation-by-operation comparison with the Go server is in [`PARITY.md`
 These answer with a clear error (`unimplemented` or `invalid argument`) instead of misbehaving:
 
 - Cron schedules and the Schedules API
-- Nexus operations, update-with-start (`ExecuteMultiOperation`) and update completion callbacks
+- Nexus operations and update completion callbacks
 - Worker versioning / deployments, eager workflow start
-- Reset, batch operations, archival, retention clean-up (closed runs are kept)
+- Batch operations, archival, retention clean-up (closed runs are kept)
 - Advanced visibility: custom search attributes in list filters, time ranges, `OR`, `ORDER BY`
 - The Operator service (custom search attribute registration)
 - Multi-node clustering, TLS and authorization
@@ -119,7 +119,7 @@ The protos under `proto/` are the Go server's contract (MIT, from temporalio/api
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request:
 formatting (rustfmt, ruff, gofmt), clippy with warnings as errors, release build, unit tests, the
 Python and Go SDK end-to-end tests, the contract check against the Go server, and the namespace,
-workflow-task and update side-by-side checks. Locally:
+workflow-task, update and running-workflow side-by-side checks. Locally:
 
 ```bash
 cargo test                                         # unit tests
@@ -127,6 +127,7 @@ cargo test                                         # unit tests
 ./scripts/namespace-parity.sh                      # same namespace steps on the Go server and here, compared
 ./scripts/namespace-parity.sh e2e/wft_parity.py   # same workflow-task steps on both servers, compared
 ./scripts/namespace-parity.sh e2e/update_parity.py  # same workflow-update steps on both servers, compared
+./scripts/namespace-parity.sh e2e/running_parity.py # history paging, delete, update-with-start, options, reset
 ./scripts/sync-protos.sh --check                    # proto/ still matches the Go server's contract
 ```
 

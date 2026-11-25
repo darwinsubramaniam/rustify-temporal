@@ -11,6 +11,7 @@ pub mod proto {
 }
 
 mod engine;
+mod mask;
 mod service;
 mod state;
 mod store;
@@ -128,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
         // delayed ACKs add ~40-100 ms to every long-poll answer.
         .tcp_nodelay(true)
         .add_service(health_service)
-        .add_service(svc)
+        .add_service(mask::MaskInternal(svc))
         .add_service(OperatorServiceServer::new(Operator))
         .add_service(AdminServiceServer::new(Admin))
         .serve_with_shutdown(addr, async {

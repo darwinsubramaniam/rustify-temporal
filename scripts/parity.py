@@ -29,9 +29,8 @@ implemented = set(re.findall(r"async fn (\w+)\(", (ROOT / "src/service.rs").read
 
 # Where an implemented operation is only partly there.
 PARTIAL = {
-    "StartWorkflowExecution": "No cron schedules, eager workflow start, completion callbacks, versioning override or links.",
+    "StartWorkflowExecution": "No cron schedules, eager workflow start, completion callbacks, versioning override or request links.",
     "SignalWithStartWorkflowExecution": "Same limits as StartWorkflowExecution.",
-    "GetWorkflowExecutionHistory": "Whole history in one page (no page size), no raw history blobs, no archival.",
     "ListWorkflowExecutions": "Filters on WorkflowId, RunId, WorkflowType, TaskQueue, ExecutionStatus with = / != and AND only.",
     "CountWorkflowExecutions": "Same filters as List; no GROUP BY.",
     "DescribeTaskQueue": "Recent pollers only; no backlog stats, rate limits or versioning info.",
@@ -43,6 +42,10 @@ PARTIAL = {
     "RecordActivityTaskHeartbeatById": "Same as RecordActivityTaskHeartbeat.",
     "GetSystemInfo": "Reports the capabilities this server has (no schedules, Nexus, eager start, versioning).",
     "GetClusterInfo": "Fixed single-cluster answer.",
+    "ResetWorkflowExecution": "Matches the Go server (137-step check): reset points, failed task, re-applied signals, updates, options and child results, request-id dedupe, exclude types, post-reset options. Children still running report to the old run.",
+    "UpdateWorkflowExecutionOptions": "Priority, with the Go server's mask merging and checks. Versioning overrides are refused (worker versioning is missing); time skipping is off, as on the Go server by default.",
+    "PauseWorkflowExecution": "Answers like a Go server with workflow pause turned off (its default).",
+    "UnpauseWorkflowExecution": "Answers like a Go server with workflow pause turned off (its default): no workflow is ever paused.",
     "UpdateWorkflowExecution": "Matches the Go server (101-step check): accept/reject/complete, speculative tasks, wait stages, limits, aborts on close. No completion callbacks (a Nexus feature).",
     "ShutdownWorker": "Accepted and ignored.",
     "RecordWorkerHeartbeat": "Accepted and ignored (worker list not kept).",
@@ -57,6 +60,10 @@ NOTES = {
     "DeprecateNamespace": "New workflows are refused; running ones carry on.",
     "RespondWorkflowTaskFailed": "Retries are transient (not written to history) like the Go server.",
     "ResetStickyTaskQueue": "A waiting sticky task moves to the normal queue.",
+    "GetWorkflowExecutionHistory": "Paged by history batches like the Go server (137-step check), long-poll and close-event filter. No raw history blobs or archival (both off on the Go server by default).",
+    "GetWorkflowExecutionHistoryReverse": "Paged by batches from the end, like the Go server.",
+    "DeleteWorkflowExecution": "Running runs are terminated first. Closed runs are removed right away (the Go server takes about 30 s).",
+    "ExecuteMultiOperation": "Update-with-start, matching the Go server (137-step check): start or reuse, answers from history, per-operation errors.",
     "PollWorkflowExecutionUpdate": "Matches the Go server (101-step check).",
 }
 
@@ -134,8 +141,9 @@ if admin:
     p(f"| AdminService (internal: tdbg, replication, DLQ tools) | {len(admin)} | 0 | 0 | {len(admin)} |")
 p("")
 p("Behaviour is checked step by step against the Go server with `scripts/namespace-parity.sh`:")
-p("namespaces (38 steps), workflow tasks (`e2e/wft_parity.py`, 67 steps) and workflow updates")
-p("(`e2e/update_parity.py`, 101 steps), all identical. Deprecated")
+p("namespaces (38 steps), workflow tasks (`e2e/wft_parity.py`, 67 steps), workflow updates")
+p("(`e2e/update_parity.py`, 101 steps) and running workflows (`e2e/running_parity.py`, 137 steps:")
+p("history paging, delete, update-with-start, options, pause, reset), all identical. Deprecated")
 p("namespaces refuse new workflows, deleted ones refuse everything but describe and list.\n")
 p("Everything a worker needs to run workflows (start, workflow and activity tasks, timers, signals,")
 p("queries, updates, children, continue-as-new, retries, cancel, terminate, history) is in the ✅ and 🟡 rows.\n")
@@ -204,10 +212,17 @@ for row in [
         "Workflow updates",
         "✅",
         "✅ Yes",
-        "Speculative tasks, rejections leave no history, limits (10 in flight, 2000 total), continue-as-new hint. Update-with-start needs ExecuteMultiOperation (missing).",
+        "Speculative tasks, rejections leave no history, limits (10 in flight, 2000 total), continue-as-new hint, update-with-start.",
     ),
     ("Nexus operations", "✅", "❌ No", ""),
-    ("Reset, pause/unpause, delete workflow", "✅", "❌ No", ""),
+    (
+        "Reset workflow",
+        "✅",
+        "✅ Yes",
+        "Rebuilt from history; signals, updates, options and child results after the reset point applied again.",
+    ),
+    ("Delete workflow", "✅", "✅ Yes", "Closed runs are removed right away (the Go server takes about 30 s)."),
+    ("Pause/unpause workflow", "Off by default", "Off", "Answers like a Go server with pause turned off."),
     (
         "Sticky queues: schedule-to-start timeout, reset",
         "✅",
@@ -282,7 +297,7 @@ for row in [
         "Official SDK compatibility",
         "All SDKs",
         "🟡 Partial",
-        "Python SDK 1.36.1 (24 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested.",
+        "Python SDK 1.36.1 (28 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested.",
     ),
 ]:
     p("| " + " | ".join(row) + " |")

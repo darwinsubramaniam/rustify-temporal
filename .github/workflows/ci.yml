@@ -119,3 +119,5 @@ jobs:
         run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/namespace-parity.sh e2e/wft_parity.py
       - name: Workflow updates - same steps on the Go server and rustify-temporal
         run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/namespace-parity.sh e2e/update_parity.py
+      - name: Running workflows - same steps on the Go server and rustify-temporal
+        run: TEMPORAL_SRC="$GITHUB_WORKSPACE/.ci/temporal" ./scripts/namespace-parity.sh e2e/running_parity.py
