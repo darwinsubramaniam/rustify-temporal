@@ -1,9 +1,10 @@
 //! Workflow tasks: handing them to workers, and applying the commands a worker sends back.
 
 use super::events::{
-    base_wft_timeout, flush_buffered, push, suggest_continue_as_new, transient_events, wft_scheduled_attrs,
-    wft_started_attrs,
+    base_wft_timeout, flush_buffered, push, schedule_to_start_ms, suggest_continue_as_new, transient_events,
+    wft_scheduled_attrs, wft_started_attrs, write_unwritten_wft_events,
 };
+use super::update::{self, Abort, MsgError, Step};
 use prost::Message;
 
 use super::*;
@@ -26,7 +27,7 @@ impl Inner {
             };
             let r = match t {
                 TaskRef::Wft { run_id, scheduled_id } => {
-                    self.start_wft(&(ns.to_string(), run_id), scheduled_id, queue, identity, false)?
+                    self.start_wft(&(ns.to_string(), run_id), scheduled_id, queue, identity, false, false)?
                 }
                 TaskRef::Query { query_id } => self.start_query_task(&query_id, queue)?,
                 TaskRef::Activity { .. } => None,
@@ -38,7 +39,8 @@ impl Inner {
     }
 
     /// Mark the workflow task started and build what the worker receives. `partial` sends only
-    /// the events since the last completed task (for a task returned with a completion).
+    /// the events since the last completed task (for a task returned with a completion);
+    /// `heartbeat` (a task the worker forced) carries only updates it hasn't been sent yet.
     pub fn start_wft(
         &mut self,
         key: &Key,
@@ -46,6 +48,7 @@ impl Inner {
         queue: &str,
         identity: &str,
         partial: bool,
+        heartbeat: bool,
     ) -> R<Option<wsv1::PollWorkflowTaskQueueResponse>> {
         let Some(ex) = self.execs.get(key) else { return Ok(None) };
         let valid = ex.s.is_open()
@@ -55,6 +58,11 @@ impl Inner {
                 .as_ref()
                 .is_some_and(|w| w.scheduled_id == scheduled_id && w.started_id == 0 && w.queue == queue);
         if !valid {
+            return Ok(None);
+        }
+        // A speculative task with no updates left to deliver is dropped by matching (Go server);
+        // its schedule-to-start timeout turns it into a normal task.
+        if ex.s.wft.as_ref().is_some_and(|w| w.speculative) && !ex.updates.has_outgoing(!heartbeat) {
             return Ok(None);
         }
         let mut ex = self.execs.remove(key).expect("present");
@@ -76,7 +84,7 @@ impl Inner {
         w.started_ms = now;
         w.history_size_at_start = ex.s.history_size;
         let reasons = suggest_continue_as_new(&ex);
-        w.started_id = if w.transient {
+        w.started_id = if w.transient || w.speculative {
             w.scheduled_id + 1
         } else {
             push(
@@ -87,7 +95,7 @@ impl Inner {
         let (sid, started_id, attempt, timeout, sched_ms) =
             (w.scheduled_id, w.started_id, w.attempt, w.timeout_ms, w.scheduled_ms);
         ex.s.wft = Some(w);
-        if !ex.s.wft.as_ref().is_some_and(|w| w.transient) {
+        if !ex.s.wft.as_ref().is_some_and(|w| w.transient || w.speculative) {
             ex.notify.notify_waiters();
         }
         self.add_timer(
@@ -106,6 +114,7 @@ impl Inner {
         let mut events: Vec<_> = ex.events.iter().filter(|e| e.event_id >= first).cloned().collect();
         events.extend(transient_events(&ex));
         let queries = self.attach_queries(key, started_id);
+        let messages = update::send_messages(&mut ex, started_id, !heartbeat);
         let token = TaskToken {
             k: "wft".into(),
             ns: key.0.clone(),
@@ -114,6 +123,7 @@ impl Inner {
             sid,
             att: attempt,
             st: started_id,
+            stt: now,
             ..Default::default()
         };
         let backlog = self.queue(&key.0, queue, QKind::Workflow).tasks.len() as i64;
@@ -139,6 +149,7 @@ impl Inner {
             scheduled_time: Some(ts_from_ms(sched_ms)),
             started_time: Some(ts_from_ms(now)),
             queries,
+            messages,
             ..Default::default()
         };
         self.put(ex);
@@ -153,11 +164,12 @@ impl Inner {
         let ok = {
             let ex = &self.execs[&key];
             ex.s.is_open()
-                && ex
-                    .s
-                    .wft
-                    .as_ref()
-                    .is_some_and(|w| w.scheduled_id == tok.sid && w.started_id == tok.st && w.started_id > 0)
+                && ex.s.wft.as_ref().is_some_and(|w| {
+                    w.scheduled_id == tok.sid
+                        && w.started_id == tok.st
+                        && w.started_id > 0
+                        && (tok.stt == 0 || tok.stt == w.started_ms)
+                })
         };
         if !ok {
             return Err(task_not_found());
@@ -192,8 +204,8 @@ impl Inner {
             return Err(st);
         }
 
-        // Check every command before writing anything; a bad one fails the task (or, for an
-        // oversized payload, terminates the workflow), as the Go server does.
+        // Check every command and update message before writing anything; a bad one fails the
+        // task (or, for an oversized payload, terminates the workflow), as the Go server does.
         let mut reject = validate_commands(&ex, &r.commands).err();
         // A workflow can't close while new events it hasn't seen are waiting.
         let closes = r.commands.iter().any(|c| {
@@ -212,40 +224,66 @@ impl Inner {
                 terminate: false,
             });
         }
+        let mut steps = Vec::new();
+        if reject.is_none() {
+            match update::plan_messages(&ex, &r.commands, &r.messages) {
+                Ok(s) => steps = s,
+                Err(MsgError::Fail(rj)) => reject = Some(rj),
+                Err(MsgError::Error(st)) => {
+                    self.put(ex);
+                    return Err(st);
+                }
+            }
+        }
         if let Some(reject) = reject {
             let st = self.reject_wft(&mut ex, &w, reject, &r.identity);
             self.put(ex);
             return Err(st);
         }
 
-        // A transient retry's scheduled and started events are written now that it completed.
-        if w.transient {
-            let sticky = !ex.s.sticky_queue.is_empty() && w.queue == ex.s.sticky_queue;
-            let attrs = wft_scheduled_attrs(&ex, &w.queue, sticky, w.timeout_ms, w.attempt);
-            push(&mut ex, A::WorkflowTaskScheduledEventAttributes(attrs));
-            let reasons = suggest_continue_as_new(&ex);
-            push(
-                &mut ex,
-                A::WorkflowTaskStartedEventAttributes(wft_started_attrs(&w, reasons)),
-            );
-        }
+        // A speculative task that only rejected updates (and changed nothing else) disappears:
+        // none of its events are written and the worker rolls back to its previous task.
+        let discard = w.speculative
+            && r.commands.is_empty()
+            && !r.force_create_new_workflow_task
+            && {
+                let may_resend = r
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|c| c.discard_speculative_workflow_task_with_events);
+                let shipped = ex.s.next_event_id - (ex.s.last_completed_started_id + 2);
+                if may_resend {
+                    shipped <= update::DISCARD_SPECULATIVE_MAX_EVENTS
+                } else {
+                    shipped <= 0
+                }
+            }
+            && r.messages.iter().all(update::is_rejection);
 
-        let completed_id = push(
-            &mut ex,
-            A::WorkflowTaskCompletedEventAttributes(history::WorkflowTaskCompletedEventAttributes {
-                scheduled_event_id: w.scheduled_id,
-                started_event_id: w.started_id,
-                identity: r.identity.clone(),
-                binary_checksum: r.binary_checksum.clone(),
-                worker_version: r.worker_version_stamp.clone(),
-                sdk_metadata: r.sdk_metadata.clone(),
-                metering_metadata: r.metering_metadata,
-                deployment: r.deployment.clone(),
-                versioning_behavior: r.versioning_behavior,
-                ..Default::default()
-            }),
-        );
-        ex.s.last_completed_started_id = w.started_id;
+        let mut completed_id = 0;
+        if !discard {
+            // A transient retry's or speculative task's scheduled and started events are
+            // written now that it completed.
+            if w.transient || w.speculative {
+                write_unwritten_wft_events(&mut ex, &w);
+            }
+            completed_id = push(
+                &mut ex,
+                A::WorkflowTaskCompletedEventAttributes(history::WorkflowTaskCompletedEventAttributes {
+                    scheduled_event_id: w.scheduled_id,
+                    started_event_id: w.started_id,
+                    identity: r.identity.clone(),
+                    binary_checksum: r.binary_checksum.clone(),
+                    worker_version: r.worker_version_stamp.clone(),
+                    sdk_metadata: r.sdk_metadata.clone(),
+                    metering_metadata: r.metering_metadata,
+                    deployment: r.deployment.clone(),
+                    versioning_behavior: r.versioning_behavior,
+                    ..Default::default()
+                }),
+            );
+            ex.s.last_completed_started_id = w.started_id;
+        }
         ex.s.wft = None;
         match r.sticky_attributes.as_ref().and_then(|s| {
             s.worker_task_queue
@@ -263,22 +301,43 @@ impl Inner {
 
         let mut need_new_task = false;
         let mut eager = Vec::new();
-        for c in r.commands {
-            if !ex.s.is_open() {
-                break;
+        let mut commands: Vec<Option<command::Command>> = r.commands.into_iter().map(Some).collect();
+        // A run closed by these commands aborts its updates only after every message is handled.
+        self.defer_update_abort = true;
+        for step in steps {
+            match step {
+                Step::Command(i) => {
+                    if !ex.s.is_open() {
+                        continue;
+                    }
+                    let Some(c) = commands[i].take() else { continue };
+                    let Some(a) = c.attributes else { continue };
+                    let user_metadata = c.user_metadata;
+                    let effect = match self.apply_command(&mut ex, a, completed_id, &r.identity) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            self.defer_update_abort = false;
+                            return Err(e);
+                        }
+                    };
+                    need_new_task |= effect.new_task;
+                    eager.extend(effect.eager_activity);
+                    if user_metadata.is_some()
+                        && let Some(last) = ex.events.last_mut()
+                        && last.event_id > completed_id
+                        && last.user_metadata.is_none()
+                    {
+                        last.user_metadata = user_metadata;
+                    }
+                }
+                Step::Message(i) => update::apply_message(&mut ex, &r.messages[i]),
+                Step::SkipMessage => {}
             }
-            let Some(a) = c.attributes else { continue };
-            let user_metadata = c.user_metadata;
-            let effect = self.apply_command(&mut ex, a, completed_id, &r.identity)?;
-            need_new_task |= effect.new_task;
-            eager.extend(effect.eager_activity);
-            if user_metadata.is_some()
-                && let Some(last) = ex.events.last_mut()
-                && last.event_id > completed_id
-                && last.user_metadata.is_none()
-            {
-                last.user_metadata = user_metadata;
-            }
+        }
+        self.defer_update_abort = false;
+        // Updates sent on this task that the worker ignored are rejected on its behalf.
+        if ex.s.is_open() && !r.force_create_new_workflow_task {
+            update::reject_unprocessed(&mut ex);
         }
 
         // Activities the worker asked to run right away are handed back in the response.
@@ -293,26 +352,51 @@ impl Inner {
         let mut new_task = None;
         if ex.s.is_open() {
             let had_buffered = flush_buffered(&mut ex);
+            let k = ex.key();
             if had_buffered || need_new_task || r.force_create_new_workflow_task {
                 self.schedule_wft(&mut ex, 1);
+            } else if ex.updates.has_outgoing(true) {
+                // Updates that arrived while this task ran: a speculative task when it goes
+                // straight back to the worker, otherwise a normal one.
                 if r.return_new_workflow_task {
-                    let w = ex.s.wft.clone().expect("scheduled");
-                    let k = ex.key();
-                    self.put(ex);
-                    new_task = self.start_wft(&k, w.scheduled_id, &w.queue, &r.identity, true)?;
-                    ex = self.take(&k)?;
+                    self.schedule_speculative_wft(&mut ex);
+                } else {
+                    self.schedule_wft(&mut ex, 1);
                 }
             }
+            if r.return_new_workflow_task
+                && let Some(w) = ex.s.wft.clone().filter(|w| w.started_id == 0)
+            {
+                self.put(ex);
+                new_task = self.start_wft(
+                    &k,
+                    w.scheduled_id,
+                    &w.queue,
+                    &r.identity,
+                    true,
+                    r.force_create_new_workflow_task,
+                )?;
+                ex = self.take(&k)?;
+            }
+        } else {
+            let reason = if ex.s.new_run_id.is_empty() {
+                Abort::Closed
+            } else {
+                Abort::Continuing
+            };
+            update::abort_updates(&mut ex, reason);
         }
+        ex.updates.publish();
         // Queries that arrived while this task ran and have no task to ride on go out on their own.
         if ex.s.wft.is_none() {
             self.requeue_queries(&ex);
         }
+        let reset_history_event_id = if discard { ex.s.last_completed_started_id } else { 0 };
         self.put(ex);
         Ok(wsv1::RespondWorkflowTaskCompletedResponse {
             workflow_task: new_task,
             activity_tasks,
-            reset_history_event_id: 0,
+            reset_history_event_id,
         })
     }
 
@@ -705,6 +789,8 @@ impl Inner {
         } else {
             format!("{}: {}", reject.cause.as_str_name(), reject.msg)
         };
+        // Updates the failed task carried can't be answered by it (Go server's abort reasons).
+        update::abort_updates(ex, Abort::TaskFailed);
         if w.attempt > 1 && reject.cause != enums::WorkflowTaskFailedCause::UnhandledCommand {
             return invalid(msg);
         }
@@ -749,6 +835,9 @@ impl Inner {
         identity: &str,
     ) -> i32 {
         let w = ex.s.wft.clone().expect("running task");
+        if w.speculative {
+            write_unwritten_wft_events(ex, &w);
+        }
         if !w.transient {
             push(
                 ex,
@@ -777,17 +866,20 @@ impl Inner {
 
     pub fn wft_timed_out(&mut self, key: &Key, scheduled_id: i64, started_id: i64) -> R<()> {
         let Some(ex) = self.execs.get(key) else { return Ok(()) };
+        // A speculative task can be replaced by one with the same event ids: only time out the
+        // task this timer was set for.
         let valid = ex.s.is_open()
-            && ex
-                .s
-                .wft
-                .as_ref()
-                .is_some_and(|w| w.scheduled_id == scheduled_id && w.started_id == started_id);
+            && ex.s.wft.as_ref().is_some_and(|w| {
+                w.scheduled_id == scheduled_id && w.started_id == started_id && now_ms() >= w.started_ms + w.timeout_ms
+            });
         if !valid {
             return Ok(());
         }
         let mut ex = self.take(key)?;
         let w = ex.s.wft.clone().expect("checked");
+        if w.speculative {
+            write_unwritten_wft_events(&mut ex, &w);
+        }
         if !w.transient {
             push(
                 &mut ex,
@@ -804,21 +896,26 @@ impl Inner {
         Ok(())
     }
 
-    /// The sticky worker didn't pick the task up in time: record the schedule-to-start timeout
-    /// and schedule a new task on the normal queue (Go server).
+    /// The sticky worker didn't pick the task up in time (or nobody took a speculative task):
+    /// record the schedule-to-start timeout and schedule a new task on the normal queue (Go server).
     pub fn sticky_timed_out(&mut self, key: &Key, scheduled_id: i64) -> R<()> {
         let Some(ex) = self.execs.get(key) else { return Ok(()) };
+        let due = schedule_to_start_ms(ex);
         let valid = ex.s.is_open()
-            && ex
-                .s
-                .wft
-                .as_ref()
-                .is_some_and(|w| w.scheduled_id == scheduled_id && w.started_id == 0 && w.queue != ex.s.task_queue);
+            && ex.s.wft.as_ref().is_some_and(|w| {
+                w.scheduled_id == scheduled_id
+                    && w.started_id == 0
+                    && (w.queue != ex.s.task_queue || w.speculative)
+                    && now_ms() >= w.scheduled_ms + due
+            });
         if !valid {
             return Ok(());
         }
         let mut ex = self.take(key)?;
         let w = ex.s.wft.clone().expect("checked");
+        if w.speculative {
+            write_unwritten_wft_events(&mut ex, &w);
+        }
         if !w.transient {
             push(
                 &mut ex,
@@ -1066,12 +1163,6 @@ fn validate_commands(ex: &Execution, cmds: &[command::Command]) -> Result<(), Re
                         "ModifyWorkflowPropertiesCommandAttributes exceeds size limit.",
                     ));
                 }
-            }
-            Some(C::ProtocolMessageCommandAttributes(_)) => {
-                return Err(fail(
-                    F::BadUpdateWorkflowExecutionMessage,
-                    "Workflow updates are not supported by this server yet.".into(),
-                ));
             }
             Some(C::ScheduleNexusOperationCommandAttributes(_))
             | Some(C::RequestCancelNexusOperationCommandAttributes(_)) => {

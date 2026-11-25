@@ -4,7 +4,7 @@ A Temporal-compatible workflow server written in Rust. The official Temporal SDK
 exactly as they connect to the Temporal server: same gRPC API (`temporal.api.workflowservice.v1`),
 same port (7233), no SDK changes. Everything is stored in one SQLite file.
 
-Tested end to end with the official **Python SDK** (`temporalio` 1.36.1, 23 scenarios) and the
+Tested end to end with the official **Python SDK** (`temporalio` 1.36.1, 24 scenarios) and the
 official **Go SDK** (`go.temporal.io/sdk` 1.51.0).
 
 ## Run it
@@ -36,6 +36,7 @@ client = await Client.connect("127.0.0.1:7233", namespace="default")
 | Workflow retries | retry policy on workflows, execution and run timeouts |
 | Children | start, started/completed/failed/canceled/timed-out/terminated events, parent close policy (terminate, request cancel, abandon) |
 | Queries | ride along on the next workflow task, or go to a worker as a query-only task; reject conditions |
+| Updates | `UpdateWorkflowExecution` / `PollWorkflowExecutionUpdate`, same behaviour as the Go server (101 side-by-side steps): validators and rejections that leave no history, speculative workflow tasks, wait for accepted or completed, update-id dedupe, in-flight and total limits, aborts when the workflow closes or continues as new |
 | Durability | every change is written to SQLite in one transaction; open runs, timers, queued tasks and activity retries are restored after a restart |
 | Visibility | `ListWorkflowExecutions` / `CountWorkflowExecutions` with `WorkflowId`, `RunId`, `WorkflowType`, `TaskQueue`, `ExecutionStatus` filters joined with `AND` (`=` and `!=`) |
 | Other | gRPC health service, gzip compression, `GetSystemInfo`, `GetClusterInfo`, `DescribeTaskQueue` (pollers) |
@@ -49,7 +50,7 @@ The full operation-by-operation comparison with the Go server is in [`PARITY.md`
 These answer with a clear error (`unimplemented` or `invalid argument`) instead of misbehaving:
 
 - Cron schedules and the Schedules API
-- Workflow updates (`UpdateWorkflowExecution`) and Nexus operations
+- Nexus operations, update-with-start (`ExecuteMultiOperation`) and update completion callbacks
 - Worker versioning / deployments, eager workflow start
 - Reset, batch operations, archival, retention clean-up (closed runs are kept)
 - Advanced visibility: custom search attributes in list filters, time ranges, `OR`, `ORDER BY`
@@ -117,14 +118,15 @@ The protos under `proto/` are the Go server's contract (MIT, from temporalio/api
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request:
 formatting (rustfmt, ruff, gofmt), clippy with warnings as errors, release build, unit tests, the
-Python and Go SDK end-to-end tests, the contract check against the Go server, and the namespace
-side-by-side check. Locally:
+Python and Go SDK end-to-end tests, the contract check against the Go server, and the namespace,
+workflow-task and update side-by-side checks. Locally:
 
 ```bash
 cargo test                                         # unit tests
 ./scripts/e2e.sh                                   # Python SDK + Go SDK end-to-end tests
 ./scripts/namespace-parity.sh                      # same namespace steps on the Go server and here, compared
 ./scripts/namespace-parity.sh e2e/wft_parity.py   # same workflow-task steps on both servers, compared
+./scripts/namespace-parity.sh e2e/update_parity.py  # same workflow-update steps on both servers, compared
 ./scripts/sync-protos.sh --check                    # proto/ still matches the Go server's contract
 ```
 

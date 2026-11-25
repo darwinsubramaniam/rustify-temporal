@@ -7,6 +7,7 @@ use tonic::{Request, Response, Status};
 
 use crate::engine::activity::ActEnd;
 use crate::engine::namespace::{ALLOW_DEFAULT, ALLOW_START};
+use crate::engine::update::{Reached, UPDATE_LONG_POLL_MS, wait_stage};
 use crate::engine::{Engine, HISTORY_LONG_POLL_MS, LONG_POLL_MS, QKind, QueryOutcome, poll_timeout_ms};
 use crate::proto::temporal::api::workflowservice::v1::workflow_service_server::WorkflowService;
 use crate::util::*;
@@ -38,6 +39,42 @@ fn exec_of(e: &Option<common::WorkflowExecution>) -> (String, String) {
     e.as_ref()
         .map(|x| (x.workflow_id.clone(), x.run_id.clone()))
         .unwrap_or_default()
+}
+
+/// A moment past the caller's own deadline: like the Go server, an update call that runs out of
+/// the caller's time isn't answered (the caller has already given up).
+fn hard_deadline<T>(r: &Request<T>) -> Option<tokio::time::Instant> {
+    grpc_timeout(r).map(|d| tokio::time::Instant::now() + d + StdDuration::from_millis(500))
+}
+
+/// The link an update response carries: the accepted event, or the workflow for a rejection.
+fn update_link(ns: &str, wid: &str, rid: &str, reached: &Reached) -> Option<common::Link> {
+    use common::link;
+    use enums::UpdateWorkflowExecutionLifecycleStage as S;
+    if reached.stage != S::Accepted && reached.stage != S::Completed {
+        return None;
+    }
+    let variant = if reached.accepted_event_id == 0 {
+        link::Variant::Workflow(link::Workflow {
+            namespace: ns.to_string(),
+            workflow_id: wid.to_string(),
+            run_id: rid.to_string(),
+            reason: "Update rejected".into(),
+        })
+    } else {
+        link::Variant::WorkflowEvent(link::WorkflowEvent {
+            namespace: ns.to_string(),
+            workflow_id: wid.to_string(),
+            run_id: rid.to_string(),
+            reference: Some(link::workflow_event::Reference::EventRef(
+                link::workflow_event::EventReference {
+                    event_id: reached.accepted_event_id,
+                    event_type: enums::EventType::WorkflowExecutionUpdateAccepted as i32,
+                },
+            )),
+        })
+    };
+    Some(common::Link { variant: Some(variant) })
 }
 
 fn act_token(t: &[u8]) -> R<TaskToken> {
@@ -217,6 +254,125 @@ impl WorkflowService for Svc {
             i.request_cancel_key(&key, &r.reason, &r.identity, None)
         })?;
         Ok(Response::new(wsv1::RequestCancelWorkflowExecutionResponse::default()))
+    }
+
+    // ---------------- workflow updates ----------------
+
+    async fn update_workflow_execution(
+        &self,
+        req: Request<wsv1::UpdateWorkflowExecutionRequest>,
+    ) -> Res<wsv1::UpdateWorkflowExecutionResponse> {
+        use enums::UpdateWorkflowExecutionLifecycleStage as S;
+        let hard = hard_deadline(&req);
+        let mut r = req.into_inner();
+        self.check_ns(&r.namespace, ALLOW_DEFAULT)?;
+        let exec = r
+            .workflow_execution
+            .clone()
+            .ok_or_else(|| invalid("Execution is not set on request."))?;
+        if exec.workflow_id.is_empty() {
+            return Err(invalid("WorkflowId is not set on request."));
+        }
+        if !exec.run_id.is_empty() && uuid::Uuid::parse_str(&exec.run_id).is_err() {
+            return Err(invalid("Invalid RunId."));
+        }
+        let upd = r.request.get_or_insert_with(Default::default);
+        let Some(meta) = upd.meta.as_mut() else {
+            return Err(invalid("Update meta is not set on request."));
+        };
+        if meta.update_id.len() > 1000 {
+            return Err(invalid("UpdateId length exceeds limit."));
+        }
+        if meta.update_id.is_empty() {
+            meta.update_id = new_id();
+        }
+        let update_id = meta.update_id.clone();
+        match upd.input.as_ref() {
+            None => return Err(invalid("Update input is not set on request.")),
+            Some(i) if i.name.is_empty() => return Err(invalid("Update name is not set on request.")),
+            _ => {}
+        }
+        let stage = match r.wait_policy.as_ref().map(|w| w.lifecycle_stage).unwrap_or(0) {
+            0 => S::Completed,
+            v => S::try_from(v).unwrap_or(S::Completed),
+        };
+        if stage == S::Admitted {
+            return Err(Status::permission_denied(
+                "UpdateWorkflowExecution issued asynchronously and waiting on update admitted is not supported.",
+            ));
+        }
+        let upd = upd.clone();
+        // An update the server dropped before the workflow saw it is admitted again (the Go
+        // server retries these internally).
+        let started = tokio::time::Instant::now();
+        let mut backoff = 50;
+        loop {
+            let h = self.engine.op(|i| {
+                let key = i.resolve(&r.namespace, &exec.workflow_id, &exec.run_id)?;
+                i.update_workflow(&key, &r.first_execution_run_id, upd.clone())
+            })?;
+            match wait_stage(h.rx, stage, UPDATE_LONG_POLL_MS, hard).await {
+                Err(e)
+                    if e.code() == tonic::Code::Unavailable
+                        && started.elapsed() < StdDuration::from_millis(UPDATE_LONG_POLL_MS as u64)
+                        && hard.is_none_or(|h| tokio::time::Instant::now() + std_dur(backoff) < h) =>
+                {
+                    tokio::time::sleep(std_dur(backoff)).await;
+                    backoff = (backoff * 2).min(1000);
+                }
+                Err(e) => return Err(e),
+                Ok(reached) => {
+                    let link = update_link(&r.namespace, &h.workflow_id, &h.run_id, &reached);
+                    return Ok(Response::new(wsv1::UpdateWorkflowExecutionResponse {
+                        update_ref: Some(update_pb::UpdateRef {
+                            workflow_execution: Some(common::WorkflowExecution {
+                                workflow_id: h.workflow_id,
+                                run_id: h.run_id,
+                            }),
+                            update_id,
+                        }),
+                        outcome: reached.outcome,
+                        stage: reached.stage as i32,
+                        link,
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+    }
+
+    async fn poll_workflow_execution_update(
+        &self,
+        req: Request<wsv1::PollWorkflowExecutionUpdateRequest>,
+    ) -> Res<wsv1::PollWorkflowExecutionUpdateResponse> {
+        use enums::UpdateWorkflowExecutionLifecycleStage as S;
+        let hard = hard_deadline(&req);
+        let r = req.into_inner();
+        let uref = r
+            .update_ref
+            .clone()
+            .ok_or_else(|| invalid("UpdateRef is not set on request."))?;
+        self.check_ns(&r.namespace, ALLOW_DEFAULT)?;
+        let stage =
+            S::try_from(r.wait_policy.as_ref().map(|w| w.lifecycle_stage).unwrap_or(0)).unwrap_or(S::Unspecified);
+        let (wid, rid) = exec_of(&uref.workflow_execution);
+        let h = self.engine.op(|i| {
+            let key = i.resolve(&r.namespace, &wid, &rid)?;
+            i.poll_update(&key, &uref.update_id)
+        })?;
+        let reached = wait_stage(h.rx, stage, UPDATE_LONG_POLL_MS, hard).await?;
+        Ok(Response::new(wsv1::PollWorkflowExecutionUpdateResponse {
+            outcome: reached.outcome,
+            stage: reached.stage as i32,
+            update_ref: Some(update_pb::UpdateRef {
+                workflow_execution: Some(common::WorkflowExecution {
+                    workflow_id: h.workflow_id,
+                    run_id: h.run_id,
+                }),
+                update_id: uref.update_id,
+            }),
+            ..Default::default()
+        }))
     }
 
     // ---------------- reading runs ----------------

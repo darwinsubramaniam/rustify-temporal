@@ -14,8 +14,10 @@ pub use crate::proto::temporal::api::errordetails::v1 as errordetails;
 pub use crate::proto::temporal::api::failure::v1 as failure;
 pub use crate::proto::temporal::api::history::v1 as history;
 pub use crate::proto::temporal::api::namespace::v1 as namespace_pb;
+pub use crate::proto::temporal::api::protocol::v1 as protocol_pb;
 pub use crate::proto::temporal::api::query::v1 as query_pb;
 pub use crate::proto::temporal::api::taskqueue::v1 as taskqueue;
+pub use crate::proto::temporal::api::update::v1 as update_pb;
 pub use crate::proto::temporal::api::workflow::v1 as workflow_pb;
 pub use crate::proto::temporal::api::workflowservice::v1 as wsv1;
 
@@ -93,6 +95,10 @@ pub struct TaskToken {
     pub q: String,
     #[serde(default)]
     pub aid: String,
+    /// Workflow-task start time (ms): a lost speculative task can't be completed in place of
+    /// a newer one with the same event ids (the Go server's StartedTime in the token).
+    #[serde(default)]
+    pub stt: i64,
 }
 
 impl TaskToken {

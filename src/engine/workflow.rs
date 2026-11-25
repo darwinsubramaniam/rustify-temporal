@@ -538,6 +538,15 @@ impl Inner {
         }
         ex.notify.notify_waiters();
         self.requeue_queries(ex);
+        // In-flight updates end with the run; callers retry onto a new run if there is one.
+        if !self.defer_update_abort {
+            let reason = if ex.s.new_run_id.is_empty() {
+                super::update::Abort::Closed
+            } else {
+                super::update::Abort::Continuing
+            };
+            super::update::abort_updates(ex, reason);
+        }
     }
 
     /// Params for the next run in the chain (retry or continue-as-new), copied from this run.
