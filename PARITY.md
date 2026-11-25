@@ -13,16 +13,17 @@ response shape, including the ones that answer *unimplemented*.
 
 | API | Operations | ✅ Yes | 🟡 Partial | ❌ No |
 |---|---|---|---|---|
-| WorkflowService (what SDKs and the CLI use) | 123 | 18 | 16 | 89 |
+| WorkflowService (what SDKs and the CLI use) | 123 | 19 | 17 | 87 |
 | OperatorService (search attributes, clusters, Nexus endpoints) | 15 | 0 | 0 | 15 |
 | AdminService (internal: tdbg, replication, DLQ tools) | 50 | 0 | 0 | 50 |
 
 Behaviour is checked step by step against the Go server with `scripts/namespace-parity.sh`:
-namespaces (38 steps) and workflow tasks (`e2e/wft_parity.py`, 67 steps), all identical. Deprecated
+namespaces (38 steps), workflow tasks (`e2e/wft_parity.py`, 67 steps) and workflow updates
+(`e2e/update_parity.py`, 101 steps), all identical. Deprecated
 namespaces refuse new workflows, deleted ones refuse everything but describe and list.
 
 Everything a worker needs to run workflows (start, workflow and activity tasks, timers, signals,
-queries, children, continue-as-new, retries, cancel, terminate, history) is in the ✅ and 🟡 rows.
+queries, updates, children, continue-as-new, retries, cancel, terminate, history) is in the ✅ and 🟡 rows.
 
 ## WorkflowService, by area
 
@@ -40,9 +41,9 @@ queries, children, continue-as-new, retries, cancel, terminate, history) is in t
 
 | Operation | rustify | Notes |
 |---|---|---|
-| `PollWorkflowTaskQueue` | 🟡 Partial | Matches the Go server (67-step check); worker-versioning and poller-autoscaling fields belong to those missing areas. |
+| `PollWorkflowTaskQueue` | 🟡 Partial | Matches the Go server (67-step and 101-step checks), including update messages; worker-versioning and poller-autoscaling fields belong to those missing areas. |
 | `ResetStickyTaskQueue` | ✅ Yes | A waiting sticky task moves to the normal queue. |
-| `RespondWorkflowTaskCompleted` | 🟡 Partial | Matches the Go server (67-step check), including eager activities, size limits and retries; workflow-update messages and Nexus commands belong to those missing areas. |
+| `RespondWorkflowTaskCompleted` | 🟡 Partial | Matches the Go server (67-step and 101-step checks), including update messages, eager activities, size limits and retries; Nexus commands belong to that missing area. |
 | `RespondWorkflowTaskFailed` | ✅ Yes | Retries are transient (not written to history) like the Go server. |
 
 ### Activity tasks (workflow activities) (9/9)
@@ -87,12 +88,12 @@ queries, children, continue-as-new, retries, cancel, terminate, history) is in t
 | `QueryWorkflow` | ✅ Yes |  |
 | `RespondQueryTaskCompleted` | ✅ Yes |  |
 
-### Workflow updates (0/2)
+### Workflow updates (2/2)
 
 | Operation | rustify | Notes |
 |---|---|---|
-| `PollWorkflowExecutionUpdate` | ❌ No |  |
-| `UpdateWorkflowExecution` | ❌ No |  |
+| `PollWorkflowExecutionUpdate` | ✅ Yes | Matches the Go server (101-step check). |
+| `UpdateWorkflowExecution` | 🟡 Partial | Matches the Go server (101-step check): accept/reject/complete, speculative tasks, wait stages, limits, aborts on close. No completion callbacks (a Nexus feature). |
 
 ### Schedules (0/8)
 
@@ -269,7 +270,7 @@ Used by `tdbg`, `temporal operator` admin commands and replication. Served with 
 | Search attribute upsert and memo update | ✅ | 🟡 Partial | Stored and shown; not searchable in list filters. |
 | Start delay | ✅ | ✅ Yes |  |
 | Cron schedules | ✅ | ❌ No | Rejected with a clear error. |
-| Workflow updates | ✅ | ❌ No |  |
+| Workflow updates | ✅ | ✅ Yes | Speculative tasks, rejections leave no history, limits (10 in flight, 2000 total), continue-as-new hint. Update-with-start needs ExecuteMultiOperation (missing). |
 | Nexus operations | ✅ | ❌ No |  |
 | Reset, pause/unpause, delete workflow | ✅ | ❌ No |  |
 | Sticky queues: schedule-to-start timeout, reset | ✅ | ✅ Yes | The timeout is recorded and the task moves to the normal queue. |
@@ -304,6 +305,6 @@ Used by `tdbg`, `temporal operator` admin commands and replication. Served with 
 | Temporal Web UI | ✅ | ❌ No | The UI needs many missing operations. |
 | Temporal CLI | ✅ | 🟡 Partial | Workflow start/signal/query/describe/list/terminate/cancel should work; schedules, batch, operator and admin commands don't. Not yet tested. |
 | Payload and history size limits | ✅ Enforced, warns and terminates | ✅ Yes | 2 MB payloads; 50 MB or 51,200-event histories terminate (Go defaults). |
-| Official SDK compatibility | All SDKs | 🟡 Partial | Python SDK 1.36.1 (23 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested. |
+| Official SDK compatibility | All SDKs | 🟡 Partial | Python SDK 1.36.1 (24 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested. |
 
 See `bench/RESULTS.md` for speed and resource use on the operations both servers have.

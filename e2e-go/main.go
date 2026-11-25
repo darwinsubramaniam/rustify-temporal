@@ -70,6 +70,29 @@ func ParentWorkflow(ctx workflow.Context, n int) (int, error) {
 	return out, err
 }
 
+// UpdateWorkflow adds numbers through an update (negative ones are rejected by its validator)
+// and finishes on the "done" signal.
+func UpdateWorkflow(ctx workflow.Context) (int, error) {
+	total := 0
+	err := workflow.SetUpdateHandlerWithOptions(ctx, "add",
+		func(ctx workflow.Context, n int) (int, error) {
+			total += n
+			return total, nil
+		},
+		workflow.UpdateHandlerOptions{Validator: func(ctx workflow.Context, n int) error {
+			if n < 0 {
+				return errors.New("negative")
+			}
+			return nil
+		}},
+	)
+	if err != nil {
+		return 0, err
+	}
+	workflow.GetSignalChannel(ctx, "done").Receive(ctx, nil)
+	return total, nil
+}
+
 func check(name string, err error, ok bool, detail any) bool {
 	if err != nil || !ok {
 		fmt.Printf("FAIL  %-12s err=%v got=%v\n", name, err, detail)
@@ -96,6 +119,7 @@ func main() {
 	w.RegisterWorkflow(CounterWorkflow)
 	w.RegisterWorkflow(ChildWorkflow)
 	w.RegisterWorkflow(ParentWorkflow)
+	w.RegisterWorkflow(UpdateWorkflow)
 	w.RegisterActivity(Greet)
 	w.RegisterActivity(Flaky)
 	if err := w.Start(); err != nil {
@@ -154,6 +178,35 @@ func main() {
 		err = run.Get(ctx, &r)
 	}
 	all = check("child", err, r == 42, r) && all
+
+	run, err = c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id("go-update"), TaskQueue: tq}, UpdateWorkflow)
+	var got, final int
+	var rejected bool
+	if err == nil {
+		var h client.WorkflowUpdateHandle
+		h, err = c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
+			WorkflowID: run.GetID(), UpdateName: "add", Args: []any{5}, WaitForStage: client.WorkflowUpdateStageCompleted,
+		})
+		if err == nil {
+			err = h.Get(ctx, &got)
+		}
+	}
+	if err == nil {
+		h, uerr := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
+			WorkflowID: run.GetID(), UpdateName: "add", Args: []any{-1}, WaitForStage: client.WorkflowUpdateStageCompleted,
+		})
+		if uerr == nil {
+			uerr = h.Get(ctx, nil)
+		}
+		rejected = uerr != nil
+	}
+	if err == nil {
+		err = c.SignalWorkflow(ctx, run.GetID(), "", "done", nil)
+	}
+	if err == nil {
+		err = run.Get(ctx, &final)
+	}
+	all = check("update", err, got == 5 && rejected && final == 5, []any{got, rejected, final}) && all
 
 	if !all {
 		os.Exit(1)

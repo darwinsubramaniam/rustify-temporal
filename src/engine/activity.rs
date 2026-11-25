@@ -68,10 +68,13 @@ impl Inner {
         if !ex.s.is_open() {
             return None;
         }
-        let a = ex.s.activities.get_mut(&sid)?;
+        let a = ex.s.activities.get(&sid)?;
         if a.state != ACT_SCHEDULED || a.attempt != attempt {
             return None;
         }
+        // A write to the run: a speculative workflow task becomes a normal one (Go server).
+        super::events::convert_speculative(ex);
+        let a = ex.s.activities.get_mut(&sid)?;
         let now = now_ms();
         a.state = ACT_STARTED;
         a.started_ms = now;
@@ -189,10 +192,12 @@ impl Inner {
         if !ex.s.is_open() {
             return Err(activity_not_found());
         }
-        let a = ex.s.activities.get_mut(&tok.sid).ok_or_else(activity_not_found)?;
+        let a = ex.s.activities.get(&tok.sid).ok_or_else(activity_not_found)?;
         if a.attempt != tok.att || a.state != ACT_STARTED {
             return Err(activity_not_found());
         }
+        super::events::convert_speculative(ex);
+        let a = ex.s.activities.get_mut(&tok.sid).ok_or_else(activity_not_found)?;
         if details.is_some() {
             a.heartbeat_details = details;
         }

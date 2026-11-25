@@ -36,13 +36,14 @@ PARTIAL = {
     "CountWorkflowExecutions": "Same filters as List; no GROUP BY.",
     "DescribeTaskQueue": "Recent pollers only; no backlog stats, rate limits or versioning info.",
     "DescribeWorkflowExecution": "No callbacks, pending Nexus operations or versioning info.",
-    "RespondWorkflowTaskCompleted": "Matches the Go server (67-step check), including eager activities, size limits and retries; workflow-update messages and Nexus commands belong to those missing areas.",
-    "PollWorkflowTaskQueue": "Matches the Go server (67-step check); worker-versioning and poller-autoscaling fields belong to those missing areas.",
+    "RespondWorkflowTaskCompleted": "Matches the Go server (67-step and 101-step checks), including update messages, eager activities, size limits and retries; Nexus commands belong to that missing area.",
+    "PollWorkflowTaskQueue": "Matches the Go server (67-step and 101-step checks), including update messages; worker-versioning and poller-autoscaling fields belong to those missing areas.",
     "PollActivityTaskQueue": "No worker versioning, rate limiting or poller autoscaling hints.",
     "RecordActivityTaskHeartbeat": "Never reports activity paused or reset (those features are missing).",
     "RecordActivityTaskHeartbeatById": "Same as RecordActivityTaskHeartbeat.",
     "GetSystemInfo": "Reports the capabilities this server has (no schedules, Nexus, eager start, versioning).",
     "GetClusterInfo": "Fixed single-cluster answer.",
+    "UpdateWorkflowExecution": "Matches the Go server (101-step check): accept/reject/complete, speculative tasks, wait stages, limits, aborts on close. No completion callbacks (a Nexus feature).",
     "ShutdownWorker": "Accepted and ignored.",
     "RecordWorkerHeartbeat": "Accepted and ignored (worker list not kept).",
 }
@@ -56,6 +57,7 @@ NOTES = {
     "DeprecateNamespace": "New workflows are refused; running ones carry on.",
     "RespondWorkflowTaskFailed": "Retries are transient (not written to history) like the Go server.",
     "ResetStickyTaskQueue": "A waiting sticky task moves to the normal queue.",
+    "PollWorkflowExecutionUpdate": "Matches the Go server (101-step check).",
 }
 
 GROUPS = [
@@ -132,10 +134,11 @@ if admin:
     p(f"| AdminService (internal: tdbg, replication, DLQ tools) | {len(admin)} | 0 | 0 | {len(admin)} |")
 p("")
 p("Behaviour is checked step by step against the Go server with `scripts/namespace-parity.sh`:")
-p("namespaces (38 steps) and workflow tasks (`e2e/wft_parity.py`, 67 steps), all identical. Deprecated")
+p("namespaces (38 steps), workflow tasks (`e2e/wft_parity.py`, 67 steps) and workflow updates")
+p("(`e2e/update_parity.py`, 101 steps), all identical. Deprecated")
 p("namespaces refuse new workflows, deleted ones refuse everything but describe and list.\n")
 p("Everything a worker needs to run workflows (start, workflow and activity tasks, timers, signals,")
-p("queries, children, continue-as-new, retries, cancel, terminate, history) is in the ✅ and 🟡 rows.\n")
+p("queries, updates, children, continue-as-new, retries, cancel, terminate, history) is in the ✅ and 🟡 rows.\n")
 
 p("## WorkflowService, by area\n")
 for title, names in grouped.items():
@@ -197,7 +200,12 @@ for row in [
     ),
     ("Start delay", "✅", "✅ Yes", ""),
     ("Cron schedules", "✅", "❌ No", "Rejected with a clear error."),
-    ("Workflow updates", "✅", "❌ No", ""),
+    (
+        "Workflow updates",
+        "✅",
+        "✅ Yes",
+        "Speculative tasks, rejections leave no history, limits (10 in flight, 2000 total), continue-as-new hint. Update-with-start needs ExecuteMultiOperation (missing).",
+    ),
     ("Nexus operations", "✅", "❌ No", ""),
     ("Reset, pause/unpause, delete workflow", "✅", "❌ No", ""),
     (
@@ -274,7 +282,7 @@ for row in [
         "Official SDK compatibility",
         "All SDKs",
         "🟡 Partial",
-        "Python SDK 1.36.1 (23 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested.",
+        "Python SDK 1.36.1 (24 scenarios) and Go SDK 1.51.0 tested; Java, TypeScript, .NET, Ruby untested.",
     ),
 ]:
     p("| " + " | ".join(row) + " |")

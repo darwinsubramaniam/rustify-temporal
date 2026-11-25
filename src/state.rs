@@ -53,6 +53,21 @@ pub struct WftInfo {
     pub identity: String,
     #[prost(int64, tag = "12")]
     pub history_size_at_start: i64,
+    /// Sent only to deliver workflow updates: its events are written only if it changes the
+    /// workflow, and it is dropped if the worker just rejects the updates (Go server's
+    /// speculative workflow task).
+    #[prost(bool, tag = "13")]
+    pub speculative: bool,
+}
+
+/// Where an accepted workflow update's events are (the Go server's UpdateInfo).
+#[derive(Clone, PartialEq, Message)]
+pub struct UpdateInfo {
+    #[prost(int64, tag = "1")]
+    pub accepted_event_id: i64,
+    /// 0 until the update completes.
+    #[prost(int64, tag = "2")]
+    pub completed_event_id: i64,
 }
 
 pub const ACT_SCHEDULED: i32 = 0;
@@ -215,6 +230,9 @@ pub struct ExecState {
     pub start_time: Option<Timestamp>,
     #[prost(string, repeated, tag = "41")]
     pub signal_request_ids: Vec<String>,
+    /// Accepted (and completed) workflow updates by update id.
+    #[prost(map = "string, message", tag = "42")]
+    pub updates: HashMap<String, UpdateInfo>,
 }
 
 impl ExecState {

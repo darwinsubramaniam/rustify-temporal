@@ -7,6 +7,7 @@ mod events;
 pub mod namespace;
 mod query;
 mod timers;
+pub mod update;
 mod visibility;
 mod wft;
 mod workflow;
@@ -48,16 +49,20 @@ pub struct Execution {
     pub events: Vec<history::HistoryEvent>,
     pub saved_events: usize,
     pub notify: Arc<Notify>,
+    /// In-flight workflow updates (memory only; rebuilt from `s.updates` when loaded).
+    pub updates: update::Registry,
 }
 
 impl Execution {
     pub fn new(s: ExecState, events: Vec<history::HistoryEvent>) -> Self {
         let saved = events.len();
+        let updates = update::Registry::load(&s);
         Execution {
             s,
             events,
             saved_events: saved,
             notify: Arc::new(Notify::new()),
+            updates,
         }
     }
     pub fn key(&self) -> Key {
@@ -224,6 +229,9 @@ pub struct Inner {
     pub queries: HashMap<String, query::PendingQuery>,
     pub dirty: HashSet<Key>,
     pub actions: VecDeque<Action>,
+    /// Set while a workflow task completion runs its commands: a run it closes aborts its
+    /// updates only once all the task's update messages were handled.
+    pub defer_update_abort: bool,
 }
 
 pub struct Engine {
@@ -246,6 +254,7 @@ impl Engine {
             queries: HashMap::new(),
             dirty: HashSet::new(),
             actions: VecDeque::new(),
+            defer_update_abort: false,
         };
         inner.recover()?;
         Ok(Arc::new(Engine {
@@ -328,6 +337,10 @@ impl Inner {
         let now = now_ms();
         // Sticky workers don't survive a restart.
         ex.s.sticky_queue.clear();
+        // Neither do speculative tasks (the updates they carried were only in memory).
+        if ex.s.wft.as_ref().is_some_and(|w| w.speculative) {
+            ex.s.wft = None;
+        }
         if let Some(w) = ex.s.wft.as_mut() {
             if w.started_id > 0 {
                 let at = w.started_ms + w.timeout_ms;

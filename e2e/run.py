@@ -19,7 +19,14 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 
-from temporalio.client import Client, WorkflowExecutionStatus, WorkflowFailureError
+from temporalio.api.enums.v1 import EventType
+from temporalio.client import (
+    Client,
+    WorkflowExecutionStatus,
+    WorkflowFailureError,
+    WorkflowUpdateFailedError,
+    WorkflowUpdateStage,
+)
 from temporalio.exceptions import ActivityError, ApplicationError, TimeoutError as TemporalTimeoutError
 from temporalio.service import RPCError
 from temporalio.worker import Worker
@@ -248,6 +255,34 @@ async def t_execution_timeout(c: Client):
         assert isinstance(e.cause, TemporalTimeoutError), repr(e.cause)
 
 
+async def t_update(c: Client):
+    h = await c.start_workflow(w.UpdateWorkflow.run, id=wid("update"), task_queue=TQ)
+    assert await h.execute_update(w.UpdateWorkflow.add, "a") == 1
+    # Rejected by the validator: nothing is written to the history.
+    try:
+        await h.execute_update(w.UpdateWorkflow.add, "")
+        raise AssertionError("expected rejection")
+    except WorkflowUpdateFailedError as e:
+        assert "empty item" in str(e.cause), repr(e.cause)
+    try:
+        await h.execute_update(w.UpdateWorkflow.fail)
+        raise AssertionError("expected failure")
+    except WorkflowUpdateFailedError as e:
+        assert "on purpose" in str(e.cause), repr(e.cause)
+    assert await h.execute_update(w.UpdateWorkflow.greet, "update") == "Hello, update!"
+    # Wait for acceptance only, then for the result through the handle.
+    u = await h.start_update(w.UpdateWorkflow.add, "b", wait_for_stage=WorkflowUpdateStage.ACCEPTED, id="add-b")
+    assert await u.result() == 3
+    # The same update id again gives the same result without running it twice.
+    assert await h.execute_update(w.UpdateWorkflow.add, "b", id="add-b") == 3
+    assert await h.get_update_handle("add-b").result() == 3
+    await h.signal(w.UpdateWorkflow.finish)
+    assert await h.result() == ["a", "Hello, update!", "b"]
+    kinds = [e.event_type for e in (await h.fetch_history()).events]
+    assert kinds.count(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED) == 4, kinds
+    assert kinds.count(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_COMPLETED) == 4, kinds
+
+
 TESTS = [
     t_hello,
     t_activity_retry,
@@ -271,6 +306,7 @@ TESTS = [
     t_describe_list,
     t_unknown_workflow,
     t_execution_timeout,
+    t_update,
 ]
 
 

@@ -266,8 +266,12 @@ async def s_sticky(c):
     await r.start()
     t = await r.poll()
     out = {"complete with sticky": (await r.complete(t.task_token, [], sticky=sticky))[0]}
+    # Poll the sticky queue before the signal, as a real worker does: the Go server only sends
+    # tasks to a sticky queue that has a poller (otherwise they go to the normal queue).
+    p = asyncio.create_task(r.poll(sticky))
+    await asyncio.sleep(0.5)
     await r.signal()
-    t = await r.poll(sticky)
+    t = await p
     out["sticky poll"] = Run.task(t)
     out["complete on sticky"] = (await r.complete(t.task_token, [], sticky=sticky))[0]
     await r.signal()

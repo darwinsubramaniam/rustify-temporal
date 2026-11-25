@@ -238,6 +238,43 @@ class LocalActivityWorkflow:
         return await workflow.execute_local_activity(say_hello, name, start_to_close_timeout=timedelta(seconds=5))
 
 
+@workflow.defn
+class UpdateWorkflow:
+    def __init__(self) -> None:
+        self.items: list[str] = []
+        self.done = False
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        await workflow.wait_condition(lambda: self.done and workflow.all_handlers_finished())
+        return self.items
+
+    @workflow.update
+    def add(self, item: str) -> int:
+        self.items.append(item)
+        return len(self.items)
+
+    @add.validator
+    def validate_add(self, item: str) -> None:
+        if not item:
+            raise ValueError("empty item")
+
+    @workflow.update
+    async def greet(self, name: str) -> str:
+        # Spans several workflow tasks: accepted now, completed after the activity.
+        greeting = await workflow.execute_activity(say_hello, name, start_to_close_timeout=timedelta(seconds=10))
+        self.items.append(greeting)
+        return greeting
+
+    @workflow.update
+    def fail(self) -> None:
+        raise ApplicationError("update failed on purpose")
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.done = True
+
+
 ALL_WORKFLOWS = [
     HelloWorkflow,
     RetryWorkflow,
@@ -256,5 +293,6 @@ ALL_WORKFLOWS = [
     RetryingWorkflow,
     ManyActivitiesWorkflow,
     LocalActivityWorkflow,
+    UpdateWorkflow,
 ]
 ALL_ACTIVITIES = [say_hello, flaky, always_fails, heartbeat_then_finish, slow_without_heartbeat, wait_for_cancel]

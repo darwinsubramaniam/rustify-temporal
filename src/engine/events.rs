@@ -55,6 +55,8 @@ pub fn event_type(a: &A) -> enums::EventType {
         A::ExternalWorkflowExecutionSignaledEventAttributes(_) => E::ExternalWorkflowExecutionSignaled,
         A::UpsertWorkflowSearchAttributesEventAttributes(_) => E::UpsertWorkflowSearchAttributes,
         A::WorkflowPropertiesModifiedEventAttributes(_) => E::WorkflowPropertiesModified,
+        A::WorkflowExecutionUpdateAcceptedEventAttributes(_) => E::WorkflowExecutionUpdateAccepted,
+        A::WorkflowExecutionUpdateCompletedEventAttributes(_) => E::WorkflowExecutionUpdateCompleted,
         _ => E::Unspecified,
     }
 }
@@ -90,11 +92,53 @@ pub fn wft_running(ex: &Execution) -> bool {
 /// running it is held back and written right after that task completes. Returns the event id,
 /// or 0 when buffered.
 pub fn push_external(ex: &mut Execution, a: A) -> i64 {
+    convert_speculative(ex);
     if wft_running(ex) {
         ex.s.buffered.push(make_event(0, a));
         0
     } else {
         push(ex, a)
+    }
+}
+
+/// A speculative workflow task becomes a normal one as soon as anything else changes the run:
+/// its scheduled (and started) events are written now, as the Go server does on its next write.
+pub fn convert_speculative(ex: &mut Execution) {
+    let Some(w) = ex.s.wft.clone().filter(|w| w.speculative) else {
+        return;
+    };
+    write_unwritten_wft_events(ex, &w);
+    if let Some(w) = ex.s.wft.as_mut() {
+        w.speculative = false;
+    }
+}
+
+/// Write the scheduled (and, once started, started) events of a transient or speculative task.
+pub fn write_unwritten_wft_events(ex: &mut Execution, w: &WftInfo) {
+    let sticky = !ex.s.sticky_queue.is_empty() && w.queue == ex.s.sticky_queue;
+    let attrs = wft_scheduled_attrs(ex, &w.queue, sticky, w.timeout_ms, w.attempt);
+    push(ex, A::WorkflowTaskScheduledEventAttributes(attrs));
+    if w.started_id > 0 {
+        let reasons = suggest_continue_as_new(ex);
+        push(ex, A::WorkflowTaskStartedEventAttributes(wft_started_attrs(w, reasons)));
+    }
+}
+
+/// How long a scheduled task may wait for a worker: the sticky timeout on a sticky queue, 5 s
+/// for a speculative task on the normal queue (Go server).
+pub fn schedule_to_start_ms(ex: &Execution) -> i64 {
+    let sticky =
+        ex.s.wft
+            .as_ref()
+            .is_some_and(|w| !ex.s.sticky_queue.is_empty() && w.queue == ex.s.sticky_queue);
+    if sticky {
+        if ex.s.sticky_timeout_ms > 0 {
+            ex.s.sticky_timeout_ms
+        } else {
+            DEFAULT_STICKY_TIMEOUT_MS
+        }
+    } else {
+        super::update::SPECULATIVE_SCHEDULE_TO_START_MS
     }
 }
 
@@ -197,6 +241,7 @@ impl Inner {
             transient,
             identity: String::new(),
             history_size_at_start: 0,
+            speculative: false,
         });
         if transient {
             ex.notify.notify_waiters();
@@ -231,6 +276,7 @@ impl Inner {
     /// Before force-closing a run (terminate, timeout), close out a running workflow task and
     /// write anything held back.
     pub fn force_close_wft(&mut self, ex: &mut Execution) {
+        convert_speculative(ex);
         if let Some(w) = ex.s.wft.clone()
             && w.started_id > 0
         {
@@ -303,6 +349,9 @@ pub fn suggest_continue_as_new(ex: &Execution) -> Vec<i32> {
     if ex.s.next_event_id >= SUGGEST_CAN_HISTORY_COUNT {
         reasons.push(enums::SuggestContinueAsNewReason::TooManyHistoryEvents as i32);
     }
+    if super::update::suggest_can_for_updates(ex) {
+        reasons.push(enums::SuggestContinueAsNewReason::TooManyUpdates as i32);
+    }
     reasons
 }
 
@@ -318,15 +367,16 @@ pub fn wft_started_attrs(w: &WftInfo, reasons: Vec<i32>) -> history::WorkflowTas
     }
 }
 
-/// The unwritten events of a transient workflow task (scheduled, and started once a worker has
-/// it), shown to workers and history readers after the written history, like the Go server.
+/// The unwritten events of a transient or speculative workflow task (scheduled, and started
+/// once a worker has it), shown to workers and history readers after the written history, like
+/// the Go server.
 pub fn transient_events(ex: &Execution) -> Vec<history::HistoryEvent> {
     // Only while it still sits at the end of the history: once other events were written after
     // it was scheduled, it will start as a normal task instead.
     let Some(w) =
         ex.s.wft
             .as_ref()
-            .filter(|w| w.transient && w.scheduled_id == ex.s.next_event_id)
+            .filter(|w| (w.transient || w.speculative) && w.scheduled_id == ex.s.next_event_id)
     else {
         return Vec::new();
     };
